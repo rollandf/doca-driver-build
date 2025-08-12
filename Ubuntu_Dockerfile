@@ -140,4 +140,15 @@ RUN touch /lib/modules/${D_KERNEL_VER}/modules.order /lib/modules/${D_KERNEL_VER
 # Introduce installed kernel modules
     depmod ${D_KERNEL_VER}
 
+# Cleanup linux-modules packages to reduce CVEs (but preserve MLNX driver modules)
+RUN set -x && \
+    # Remove linux-modules packages that contain CVEs, preserving MLNX driver modules
+    test -n "${D_KERNEL_VER}" && dpkg --purge --force-depends linux-modules-extra-${D_KERNEL_VER} || true && \
+    test -n "${D_KERNEL_VER}" && dpkg --purge --force-depends linux-modules-${D_KERNEL_VER} || true && \
+    # Verify removal and clean up any remaining files
+    dpkg -l | grep linux-modules || echo "linux-modules packages removed successfully" && \
+    # Clean package cache
+    apt-get clean autoclean && \
+    rm -rf /var/lib/apt/lists/*
+
 CMD ["precompiled"]

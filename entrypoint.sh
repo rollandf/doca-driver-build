@@ -494,19 +494,10 @@ function restart_driver() {
         exec_cmd "modprobe -d /host macsec"
     fi
 
-    load_pci_hyperv_intf=false
-
-    # ARM does not contain relevant packages, also not a blocker for this OS type for mlx5_core load
-    if [ "${ARCH}" != "aarch64" ]; then
-        if ! ${IS_OS_UBUNTU}  && ! ${IS_OS_SLES}; then
-            redhat_fetch_major_ver
-            [[ $RHEL_MAJOR_VERSION -ge $RH_RT_MIN_MAJOR_VER ]] && load_pci_hyperv_intf=true
-        else
-            load_pci_hyperv_intf=true
-        fi
+    # Check if mlx5_core depends on pci-hyperv-intf if so, load it.
+    if modinfo -Fdepends mlx5_core | grep -qw  pci-hyperv-intf; then
+        exec_cmd "modprobe -d /host pci-hyperv-intf"
     fi
-
-    ${load_pci_hyperv_intf} && exec_cmd "modprobe -d /host pci-hyperv-intf"
 
     timestamp_print "Apply blacklisted mofed modules file to host (${OFED_BLACKLIST_MODULES_FILE})"
     trap 'remove_ofed_modules_blacklist' EXIT
