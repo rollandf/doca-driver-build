@@ -82,6 +82,9 @@ type Interface interface {
 	Save(ctx context.Context) error
 	// Restore the saved configuration for NVIDIA devices.
 	Restore(ctx context.Context) error
+	// DevicesUseNewNamingScheme returns true if interfaces with the new naming scheme
+	// are on the host or if no NVIDIA devices are found.
+	DevicesUseNewNamingScheme(ctx context.Context) (bool, error)
 }
 
 // VF represents a Virtual Function with all its attributes
@@ -121,7 +124,6 @@ type MellanoxDevice struct {
 	MTU         int    // MTU value
 	GUID        string // Device GUID (for IB) or "-" for Ethernet
 	EswitchMode string // Eswitch mode: "legacy" or "switchdev"
-	NetNamePath string // Udev-based network name path
 
 	// SRIOV information
 	PfNumVfs     int           // Number of VFs configured (from sriov_numvfs)
@@ -739,15 +741,6 @@ func (n *netconfig) collectDeviceInfo(ctx context.Context, devName, pciAddr stri
 
 	// Get number of VFs from sysfs (matches bash script approach)
 	device.PfNumVfs = n.getPfNumVfsFromSysfs(devName)
-
-	// Get NetNamePath using udevadm
-	netNamePath, err := n.getNetNamePath(ctx, devName)
-	if err != nil {
-		log.V(1).Info("Could not get NetNamePath", "device", devName, "error", err)
-		device.NetNamePath = ""
-	} else {
-		device.NetNamePath = netNamePath
-	}
 
 	return device
 }
@@ -1583,4 +1576,55 @@ func (n *netconfig) setRepresentorAdminState(representorName, state string) erro
 	}
 
 	return nil
+}
+
+// DevicesUseNewNamingScheme returns true if interfaces with the new naming scheme
+// are on the host or if no NVIDIA devices are found.
+func (n *netconfig) DevicesUseNewNamingScheme(ctx context.Context) (bool, error) {
+	log := logr.FromContextOrDiscard(ctx)
+
+	// Regex pattern to match np[0-3] suffix (new naming scheme)
+	npPattern := regexp.MustCompile(`np[0-3]$`)
+
+	// Get all network interfaces from sysfs (reuse existing logic)
+	entries, err := n.os.ReadDir("/sys/class/net")
+	if err != nil {
+		log.Error(err, "failed to list network devices")
+		return false, err
+	}
+
+	// Check each network device
+	for _, entry := range entries {
+		devName := entry.Name()
+
+		// Check if this is a NVIDIA device (reuse existing logic)
+		if !n.isMellanoxDeviceByInterface(devName) {
+			continue
+		}
+
+		log.V(1).Info("found NVIDIA device", "device", devName)
+
+		// Use existing getNetNamePath function instead of duplicating udevadm logic
+		netNamePath, err := n.getNetNamePath(ctx, devName)
+		if err != nil {
+			log.V(1).Info("failed to get NetNamePath for device", "device", devName, "error", err)
+			continue
+		}
+
+		if netNamePath == "" {
+			log.V(1).Info("no NetNamePath found for device", "device", devName)
+			continue
+		}
+
+		log.V(1).Info("sampling interface for NetNamePath", "device", devName, "net_name_path", netNamePath)
+
+		// Check if NetNamePath ends with np[0-3] pattern (new naming scheme)
+		if npPattern.MatchString(netNamePath) {
+			log.Info("device uses new naming scheme", "device", devName, "net_name_path", netNamePath)
+			return true, nil
+		}
+	}
+
+	log.Info("no devices found using new naming scheme")
+	return false, nil
 }
