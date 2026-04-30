@@ -127,7 +127,8 @@ export DTK_OCP_DONE_COMPILE_FLAG="%s"
 export APPEND_DRIVER_BUILD_FLAGS="%s"
 export USE_NEW_ENTRYPOINT="true"
 export NVIDIA_NIC_DRIVER_VER="%s"
-`, sharedDir, d.cfg.NvidiaNicDriverVer, startFlagPath, doneFlagPath, appendFlagsStr, d.cfg.NvidiaNicDriverVer)
+export USE_DKMS="%v"
+`, sharedDir, d.cfg.NvidiaNicDriverVer, startFlagPath, doneFlagPath, appendFlagsStr, d.cfg.NvidiaNicDriverVer, d.cfg.UseDKMS)
 
 	envPath := filepath.Join(sharedDir, "dtk.env")
 	if err := d.os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {

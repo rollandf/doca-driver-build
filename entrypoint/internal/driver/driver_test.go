@@ -1874,6 +1874,69 @@ var _ = Describe("Driver", func() {
 			Expect(dm.newDriverLoaded).To(BeFalse())
 		})
 
+		It("should skip dkms build/install when DtkOcpDriverBuild is true (kmod packages place modules)", func() {
+			cfg.UseDKMS = true
+			cfg.DtkOcpDriverBuild = true
+			dm = &driverMgr{
+				cfg:  cfg,
+				cmd:  cmdMock,
+				host: hostMock,
+				os:   osMock,
+			}
+
+			// Mock generateOfedModulesBlacklist
+			blacklistFile, err := os.CreateTemp(tempDir, "blacklist")
+			Expect(err).NotTo(HaveOccurred())
+			osMock.EXPECT().Create(cfg.OfedBlacklistModulesFile).Return(blacklistFile, nil)
+			osMock.EXPECT().Stat(cfg.OfedBlacklistModulesFile).Return(nil, nil)
+			osMock.EXPECT().RemoveAll(cfg.OfedBlacklistModulesFile).Return(nil)
+
+			// DKMS setup for DTK path: discovers module, checks status, does dkms add —
+			// then returns early without dkms build or dkms install.
+			hostMock.EXPECT().GetKernelVersion(ctx).Return("5.14.0-570.78.1.el9_6.x86_64", nil)
+			mockEntry := mockDirEntry{name: "mlnx-ofa_kernel-2604.0.43-1", isDir: true}
+			osMock.EXPECT().ReadDir("/usr/src/").Return([]os.DirEntry{mockEntry}, nil)
+			osMock.EXPECT().Stat("/usr/src/mlnx-ofa_kernel-2604.0.43-1/dkms.conf").Return(nil, nil)
+			osMock.EXPECT().ReadFile("/usr/src/mlnx-ofa_kernel-2604.0.43-1/dkms.conf").
+				Return([]byte("PACKAGE_NAME=\"mlnx-ofa_kernel\"\nPACKAGE_VERSION=\"2604.0.43-1\"\n"), nil)
+			// Not yet installed — triggers dkms add path
+			cmdMock.EXPECT().RunCommand(ctx, "dkms", "status", "mlnx-ofa_kernel", "2604.0.43-1").Return("", "", nil)
+			// dkms add status check (already added check inside dkmsAdd)
+			cmdMock.EXPECT().RunCommand(ctx, "dkms", "status", "mlnx-ofa_kernel", "2604.0.43-1").Return("", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "dkms", "add", "-m", "mlnx-ofa_kernel", "-v", "2604.0.43-1").Return("", "", nil)
+			// dkms build and dkms install must NOT be called (DTK path returns after dkms add)
+
+			// Mock checkLoadedKmodSrcverVsModinfo — modules match
+			hostMock.EXPECT().LsMod(ctx).Return(map[string]host.LoadedModule{
+				"mlx5_core": {Name: "mlx5_core", RefCount: 1, UsedBy: []string{}},
+				"mlx5_ib":   {Name: "mlx5_ib", RefCount: 1, UsedBy: []string{}},
+				"ib_core":   {Name: "ib_core", RefCount: 1, UsedBy: []string{}},
+			}, nil)
+			cmdMock.EXPECT().RunCommand(ctx, "modinfo", "mlx5_core").Return("srcversion: ABC123", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "cat", "/sys/module/mlx5_core/srcversion").Return("ABC123", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "modinfo", "mlx5_ib").Return("srcversion: DEF456", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "cat", "/sys/module/mlx5_ib/srcversion").Return("DEF456", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "modinfo", "ib_core").Return("srcversion: GHI789", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "cat", "/sys/module/ib_core/srcversion").Return("GHI789", "", nil)
+
+			// Mock printLoadedDriverVersion
+			hostMock.EXPECT().LsMod(ctx).Return(map[string]host.LoadedModule{
+				"mlx5_core": {Name: "mlx5_core", RefCount: 1, UsedBy: []string{}},
+			}, nil)
+			cmdMock.EXPECT().RunCommand(ctx, "ls", "/sys/class/net/").Return("eth0", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "readlink", "/sys/class/net/eth0/device/driver").Return("../../../../bus/pci/drivers/mlx5_core", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "ethtool", "--driver", "eth0").Return("version: 5.0-1.0.0", "", nil)
+
+			// Mock mountRootfs
+			cmdMock.EXPECT().RunCommand(ctx, "mount", "--make-runbindable", "/sys").Return("", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "mount", "--make-private", "/sys").Return("", "", nil)
+			cmdMock.EXPECT().RunCommand(ctx, "mount", "-l").Return("/usr/src/ on /run/mellanox/drivers/usr/src/ type none", "", nil)
+
+			result, err := dm.Load(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(BeTrue())
+		})
+
 		It("should restart driver when modules don't match", func() {
 			dm = &driverMgr{
 				cfg:  cfg,
@@ -4195,5 +4258,165 @@ var _ = Describe("Driver OFED Blacklist", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(os.IsNotExist(err)).To(BeTrue())
 		})
+	})
+})
+
+var _ = Describe("Driver DTK setup", func() {
+	var (
+		cmdMock *cmdMockPkg.Interface
+		ctx     context.Context
+		tempDir string
+	)
+
+	BeforeEach(func() {
+		cmdMock = cmdMockPkg.NewInterface(GinkgoT())
+		ctx = context.Background()
+		tempDir = GinkgoT().TempDir()
+	})
+
+	Context("dtkSetupDriverBuild dtk.env generation", func() {
+		// mockCpCalls sets up the three RunCommand expectations for the cp invocations
+		// inside dtkSetupDriverBuild (driver sources, entrypoint binary, build script).
+		mockCpCalls := func(dm *driverMgr, sharedDir string) {
+			srcDir := dm.cfg.NvidiaNicDriverPath
+			destDir := filepath.Join(sharedDir, "MLNX_OFED_SRC-"+dm.cfg.NvidiaNicDriverVer)
+			cmdMock.EXPECT().RunCommand(mock.Anything, "cp", "-rT", srcDir, destDir).Return("", "", nil)
+			cmdMock.EXPECT().RunCommand(mock.Anything, "cp", "/root/entrypoint",
+				filepath.Join(sharedDir, "entrypoint")).Return("", "", nil)
+			cmdMock.EXPECT().RunCommand(mock.Anything, "cp", constants.DtkOcpBuildScriptPath,
+				filepath.Join(sharedDir, filepath.Base(constants.DtkOcpBuildScriptPath))).Return("", "", nil)
+		}
+
+		It("should write USE_DKMS=true into dtk.env when UseDKMS is true", func() {
+			cfg := config.Config{
+				NvidiaNicDriverVer:  "26.04-0.5.3.0",
+				NvidiaNicDriverPath: "/run/mellanox/src/MLNX_OFED_SRC-26.04-0.5.3.0",
+				UseDKMS:             true,
+				EnableNfsRdma:       true,
+			}
+			dm := &driverMgr{cfg: cfg, cmd: cmdMock, os: wrappers.NewOS()}
+
+			sharedDir := filepath.Join(tempDir, "dkms-true")
+			startFlagPath := filepath.Join(sharedDir, "dtk_start_compile")
+			doneFlagPath := filepath.Join(sharedDir, "dtk_done_compile_ver")
+
+			mockCpCalls(dm, sharedDir)
+
+			err := dm.dtkSetupDriverBuild(ctx, sharedDir, startFlagPath, doneFlagPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			content, err := os.ReadFile(filepath.Join(sharedDir, "dtk.env"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(ContainSubstring(`export USE_DKMS="true"`))
+			// Sanity-check that other required fields are also present
+			Expect(string(content)).To(ContainSubstring(`export USE_NEW_ENTRYPOINT="true"`))
+			Expect(string(content)).To(ContainSubstring(`export NVIDIA_NIC_DRIVER_VER="26.04-0.5.3.0"`))
+		})
+
+		It("should write USE_DKMS=false into dtk.env when UseDKMS is false", func() {
+			cfg := config.Config{
+				NvidiaNicDriverVer:  "26.04-0.5.3.0",
+				NvidiaNicDriverPath: "/run/mellanox/src/MLNX_OFED_SRC-26.04-0.5.3.0",
+				UseDKMS:             false,
+				EnableNfsRdma:       true,
+			}
+			dm := &driverMgr{cfg: cfg, cmd: cmdMock, os: wrappers.NewOS()}
+
+			sharedDir := filepath.Join(tempDir, "dkms-false")
+			startFlagPath := filepath.Join(sharedDir, "dtk_start_compile")
+			doneFlagPath := filepath.Join(sharedDir, "dtk_done_compile_ver")
+
+			mockCpCalls(dm, sharedDir)
+
+			err := dm.dtkSetupDriverBuild(ctx, sharedDir, startFlagPath, doneFlagPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			content, err := os.ReadFile(filepath.Join(sharedDir, "dtk.env"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(ContainSubstring(`export USE_DKMS="false"`))
+		})
+	})
+})
+
+var _ = Describe("discoverDKMSModuleIn", func() {
+	const dkmsConf = `PACKAGE_NAME="mlnx-ofa_kernel"
+PACKAGE_VERSION="2604.0.43-1"
+`
+
+	var (
+		dm      *driverMgr
+		ctx     context.Context
+		srcBase string
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		srcBase = GinkgoT().TempDir()
+		dm = &driverMgr{os: wrappers.NewOS()}
+	})
+
+	It("finds dkms.conf directly under mlnx-ofa_kernel-* directory", func() {
+		dir := filepath.Join(srcBase, "mlnx-ofa_kernel-2604.0.43-1")
+		Expect(os.MkdirAll(dir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(dir, "dkms.conf"), []byte(dkmsConf), 0644)).To(Succeed())
+
+		name, version, err := dm.discoverDKMSModuleIn(ctx, srcBase)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("mlnx-ofa_kernel"))
+		Expect(version).To(Equal("2604.0.43-1"))
+	})
+
+	It("finds dkms.conf via a symlink to source directory (OFED 26.04 layout)", func() {
+		// Simulate: /usr/src/ofa_kernel-2604.0.43-1/source/dkms.conf
+		//           /usr/src/mlnx-ofa_kernel-2604.0.43-1 -> ofa_kernel-2604.0.43-1/source
+		realDir := filepath.Join(srcBase, "ofa_kernel-2604.0.43-1", "source")
+		Expect(os.MkdirAll(realDir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(realDir, "dkms.conf"), []byte(dkmsConf), 0644)).To(Succeed())
+		Expect(os.Symlink(realDir, filepath.Join(srcBase, "mlnx-ofa_kernel-2604.0.43-1"))).To(Succeed())
+
+		name, version, err := dm.discoverDKMSModuleIn(ctx, srcBase)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("mlnx-ofa_kernel"))
+		Expect(version).To(Equal("2604.0.43-1"))
+	})
+
+	It("finds dkms.conf nested under source/ subdirectory", func() {
+		// Simulate: /usr/src/ofa_kernel-2604.0.43-1/source/dkms.conf (no symlink)
+		sourceDir := filepath.Join(srcBase, "ofa_kernel-2604.0.43-1", "source")
+		Expect(os.MkdirAll(sourceDir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(sourceDir, "dkms.conf"), []byte(dkmsConf), 0644)).To(Succeed())
+
+		name, version, err := dm.discoverDKMSModuleIn(ctx, srcBase)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("mlnx-ofa_kernel"))
+		Expect(version).To(Equal("2604.0.43-1"))
+	})
+
+	It("prefers mlnx-ofa_kernel-* over other directories", func() {
+		// Place a generic module first
+		genericDir := filepath.Join(srcBase, "some-other-module-1.0")
+		Expect(os.MkdirAll(genericDir, 0755)).To(Succeed())
+		genericConf := `PACKAGE_NAME="some-other-module"
+PACKAGE_VERSION="1.0"
+`
+		Expect(os.WriteFile(filepath.Join(genericDir, "dkms.conf"), []byte(genericConf), 0644)).To(Succeed())
+
+		// Place mlnx-ofa_kernel-* after
+		mlnxDir := filepath.Join(srcBase, "mlnx-ofa_kernel-2604.0.43-1")
+		Expect(os.MkdirAll(mlnxDir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(mlnxDir, "dkms.conf"), []byte(dkmsConf), 0644)).To(Succeed())
+
+		name, version, err := dm.discoverDKMSModuleIn(ctx, srcBase)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("mlnx-ofa_kernel"))
+		Expect(version).To(Equal("2604.0.43-1"))
+	})
+
+	It("returns error when no dkms.conf found anywhere", func() {
+		Expect(os.MkdirAll(filepath.Join(srcBase, "some-dir"), 0755)).To(Succeed())
+
+		_, _, err := dm.discoverDKMSModuleIn(ctx, srcBase)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("no DKMS module found"))
 	})
 })
