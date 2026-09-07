@@ -36,6 +36,37 @@ import (
 	wrappersMockPkg "github.com/Mellanox/doca-driver-build/entrypoint/internal/wrappers/mocks"
 )
 
+// expectDocaSourceStaging expects the per-build assembly of the driver source archive.
+//
+// The archive is built here rather than baked into the image because component selection
+// depends on ENABLE_NFSRDMA, which can differ between restarts of the same image. These
+// expectations describe ENABLE_NFSRDMA unset: only the base component is selected, so every
+// other component doca-kernel-support can build is excluded from the archive.
+//
+// The exclude patterns differ per packaging family because the two build functions look
+// their sources up differently — SOURCES tarballs on Debian, SRPMS on RPM.
+func expectDocaSourceStaging(ctx context.Context, cmdMock *cmdMockPkg.Interface,
+	osMock *wrappersMockPkg.OSWrapper, osType string,
+) {
+	excludes := []string{
+		"iser", "isert", "srp", "mlnx-nfsrdma", "mlnx-nvme",
+		"virtiofs", "fwctl", "knem", "xpmem", "kernel-mft",
+	}
+
+	args := []any{"czf", docaStagedSourceArchive}
+	for _, component := range excludes {
+		if osType == constants.OSTypeUbuntu {
+			args = append(args, "--exclude=*/SOURCES/"+component+"_*")
+		} else {
+			args = append(args, "--exclude=*/SRPMS/"+component+"-[0-9]*.src.rpm")
+		}
+	}
+	args = append(args, "-C", "/test/driver", "path")
+
+	osMock.EXPECT().MkdirAll(mock.Anything, mock.Anything).Return(nil)
+	cmdMock.EXPECT().RunCommand(ctx, "tar", args...).Return("", "", nil)
+}
+
 var _ = Describe("Driver", func() {
 	var (
 		dm       *driverMgr
@@ -1127,9 +1158,8 @@ var _ = Describe("Driver", func() {
 			hostMock.EXPECT().GetKernelVersion(ctx).Return("5.4.0-42-generic", nil)
 			hostMock.EXPECT().GetOSType(ctx).Return(constants.OSTypeUbuntu, nil)
 
-			// Mock installUbuntuPrerequisites (now runs before cache check)
-			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "update").Return("", "", nil)
-			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "-yq", "install", "pkg-config", "linux-headers-5.4.0-42-generic").Return("", "", nil)
+			// No prerequisite install is expected: on Ubuntu without DKMS it is deferred
+			// until the cache check has decided a build is needed, and here it fails first.
 
 			// Set inventory path to trigger the error path
 			dm.cfg.NvidiaNicDriversInventoryPath = "/test/inventory"
@@ -1150,9 +1180,9 @@ var _ = Describe("Driver", func() {
 			hostMock.EXPECT().GetKernelVersion(ctx).Return("5.4.0-42-generic", nil)
 			hostMock.EXPECT().GetOSType(ctx).Return(constants.OSTypeUbuntu, nil)
 
-			// Mock installUbuntuPrerequisites (now runs before cache check)
-			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "update").Return("", "", nil)
-			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "-yq", "install", "pkg-config", "linux-headers-5.4.0-42-generic").Return("", "", nil)
+			// No linux-headers install is expected: a cache hit on Ubuntu without DKMS
+			// compiles nothing, so the prerequisite install is skipped entirely. The
+			// apt-get update further down belongs to installUbuntuDriver.
 
 			// Mock checkDriverInventory to return false (skip build) - checksums and build config match
 			osMock.EXPECT().Stat(filepath.Join(inventoryDir, "5.4.0-42-generic", "test-version")).Return(nil, nil)          // inventory directory exists
@@ -1255,14 +1285,10 @@ var _ = Describe("Driver", func() {
 			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "-yq", "install", "pkg-config", "linux-headers-5.4.0-42-generic").Return("", "", nil)
 
 			// UseDKMS false by default → install.pl must include --without-dkms
-			cmdMock.EXPECT().RunCommand(ctx, "/test/driver/path/install.pl",
-				"--without-depcheck", "--kernel", "5.4.0-42-generic", "--kernel-only", "--build-only",
-				"--with-mlnx-tools", "--without-knem-modules", "--without-iser-modules",
-				"--without-isert-modules", "--without-srp-modules", "--without-kernel-mft-modules",
-				"--without-mlnx-rdma-rxe-modules", "--disable-kmp", "--without-dkms",
-				"--without-xpmem", "--without-xpmem-modules",
-				"--without-mlnx-nfsrdma-modules",
-				"--without-mlnx-nvme-modules").Return("", "", nil)
+			expectDocaSourceStaging(ctx, cmdMock, osMock, constants.OSTypeUbuntu)
+			cmdMock.EXPECT().RunCommand(ctx, docaKernelSupportBin, "--verbose", "--dirty",
+				"--kernel", "5.4.0-42-generic",
+				"--tarfile", docaStagedSourceArchive).Return("Building under /tmp/DOCA.test\n", "", nil)
 
 			// Mock copyBuildArtifacts - debug logging and copy
 			cmdMock.EXPECT().RunCommand(ctx, "uname", "-m").Return("x86_64", "", nil)
@@ -1442,23 +1468,26 @@ var _ = Describe("Driver", func() {
 			cmdMock.EXPECT().RunCommand(ctx, "dnf", "-q", "-y", "--releasever=8.4", "install", "elfutils-libelf-devel", "kernel-rpm-macros", "numactl-libs", "lsof", "rpm-build", "patch", "hostname").Return("", "", nil)
 			cmdMock.EXPECT().RunCommand(ctx, "dnf", "makecache", "--releasever=8.4").Return("", "", nil)
 
-			// Mock buildDriverFromSource - RedHat specific arguments
-			cmdMock.EXPECT().RunCommand(ctx, "/test/driver/path/install.pl",
-				"--without-depcheck", "--kernel", "5.4.0-42", "--kernel-only", "--build-only",
-				"--with-mlnx-tools", "--without-knem", "--without-iser",
-				"--without-isert", "--without-srp", "--without-kernel-mft",
-				"--without-mlnx-rdma-rxe", "--disable-kmp", "--without-dkms",
-				"--distro", "rhel8.4",
-				"--without-xpmem", "--without-xpmem-modules",
-				"--without-mlnx-nfsrdma",
-				"--without-mlnx-nvme").Return("", "", nil)
+			// Mock buildDriverFromSource. RedHat now builds with doca-kernel-support, so
+			// os-release is rewritten to the host's version first, and the target kernel
+			// is named by its source directory rather than with -k.
+			// The image reports 8.2, the host 8.4: the build must see the host's version,
+			// and the original content must be put back afterwards.
+			originalOsRelease := []byte("ID=\"rhel\"\nVERSION_ID=\"8.2\"\n")
+			osMock.EXPECT().ReadFile(osReleasePath).Return(originalOsRelease, nil)
+			osMock.EXPECT().WriteFile(osReleasePath,
+				[]byte("ID=\"rhel\"\nVERSION_ID=\"8.4\"\n"), os.FileMode(0o644)).Return(nil).Once()
+			osMock.EXPECT().WriteFile(osReleasePath,
+				originalOsRelease, os.FileMode(0o644)).Return(nil).Once()
+			expectDocaSourceStaging(ctx, cmdMock, osMock, constants.OSTypeRedHat)
+			cmdMock.EXPECT().RunCommand(ctx, docaKernelSupportBin, "--verbose", "--dirty",
+				"-s", "/usr/src/kernels/5.4.0-42",
+				"--tarfile", docaStagedSourceArchive).Return("Building under /tmp/DOCA.test\n", "", nil)
 
-			// Mock copyBuildArtifacts - debug logging and copy
+			// Collecting the tool's RPMs, the mlnx-tools rpmbuild and its package, then
+			// the listing and copy in copyBuildArtifacts.
 			cmdMock.EXPECT().RunCommand(ctx, "uname", "-m").Return("x86_64", "", nil)
-			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.Anything).Return("", "", nil) // ls -la source directory
-			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.Anything).Return("", "", nil) // find .deb files
-			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.Anything).Return("", "", nil) // ls -la destination directory
-			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.Anything).Return("", "", nil) // cp command
+			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.Anything).Return("", "", nil).Times(5)
 
 			// Note: storeBuildChecksum is not called when NvidiaNicDriversInventoryPath is empty
 
@@ -1630,14 +1659,10 @@ var _ = Describe("Driver", func() {
 
 			// Mock buildDriverFromSource failure - Ubuntu specific arguments
 			expectedError := errors.New("install.pl failed")
-			cmdMock.EXPECT().RunCommand(ctx, "/test/driver/path/install.pl",
-				"--without-depcheck", "--kernel", "5.4.0-42-generic", "--kernel-only", "--build-only",
-				"--with-mlnx-tools", "--without-knem-modules", "--without-iser-modules",
-				"--without-isert-modules", "--without-srp-modules", "--without-kernel-mft-modules",
-				"--without-mlnx-rdma-rxe-modules", "--disable-kmp", "--without-dkms",
-				"--without-xpmem", "--without-xpmem-modules",
-				"--without-mlnx-nfsrdma-modules",
-				"--without-mlnx-nvme-modules").Return("", "", expectedError)
+			expectDocaSourceStaging(ctx, cmdMock, osMock, constants.OSTypeUbuntu)
+			cmdMock.EXPECT().RunCommand(ctx, docaKernelSupportBin, "--verbose", "--dirty",
+				"--kernel", "5.4.0-42-generic",
+				"--tarfile", docaStagedSourceArchive).Return("", "", expectedError)
 
 			err := dm.Build(ctx)
 			Expect(err).To(HaveOccurred())
@@ -1666,30 +1691,32 @@ var _ = Describe("Driver", func() {
 			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "-yq", "install", "pkg-config", "linux-headers-5.4.0-42-generic").Return("", "", nil)
 
 			// Mock buildDriverFromSource - Ubuntu specific arguments
-			cmdMock.EXPECT().RunCommand(ctx, "/test/driver/path/install.pl",
-				"--without-depcheck", "--kernel", "5.4.0-42-generic", "--kernel-only", "--build-only",
-				"--with-mlnx-tools", "--without-knem-modules", "--without-iser-modules",
-				"--without-isert-modules", "--without-srp-modules", "--without-kernel-mft-modules",
-				"--without-mlnx-rdma-rxe-modules", "--disable-kmp", "--without-dkms",
-				"--without-xpmem", "--without-xpmem-modules",
-				"--without-mlnx-nfsrdma-modules",
-				"--without-mlnx-nvme-modules").Return("", "", nil)
+			expectDocaSourceStaging(ctx, cmdMock, osMock, constants.OSTypeUbuntu)
+			cmdMock.EXPECT().RunCommand(ctx, docaKernelSupportBin, "--verbose", "--dirty",
+				"--kernel", "5.4.0-42-generic",
+				"--tarfile", docaStagedSourceArchive).Return("Building under /tmp/DOCA.test\n", "", nil)
 
-			// Mock copyBuildArtifacts failure - debug logging and copy failure
+			// Mock copyBuildArtifacts failure. The build itself now issues several sh -c
+			// commands before copyBuildArtifacts runs, so each matcher has to identify its
+			// own: those have to succeed for the failure under test to be the one
+			// copyBuildArtifacts reports rather than an earlier one.
 			cmdMock.EXPECT().RunCommand(ctx, "uname", "-m").Return("x86_64", "", nil)
 			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.MatchedBy(func(cmd string) bool {
-				return strings.Contains(cmd, "ls -la") && strings.Contains(cmd, "DEBS")
-			})).Return("", "", nil) // ls -la source directory
+				return strings.Contains(cmd, "/tmp/DOCA.test/packages")
+			})).Return("", "", nil) // collect packages from the tool's work directory
 			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.MatchedBy(func(cmd string) bool {
-				return strings.Contains(cmd, "find") && strings.Contains(cmd, "*.deb")
-			})).Return("", "", nil) // find .deb files
+				return strings.Contains(cmd, "dpkg-buildpackage")
+			})).Return("", "", nil) // mlnx-tools build
 			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.MatchedBy(func(cmd string) bool {
-				return strings.Contains(cmd, "ls -la") && !strings.Contains(cmd, "DEBS")
-			})).Return("", "", nil) // ls -la destination directory
+				return strings.HasPrefix(cmd, "mv ")
+			})).Return("", "", nil) // collect the mlnx-tools package
+			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.MatchedBy(func(cmd string) bool {
+				return strings.HasPrefix(cmd, "ls -la")
+			})).Return("", "", nil) // list the build output directory
 			expectedError := errors.New("cp failed")
 			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.MatchedBy(func(cmd string) bool {
-				return strings.Contains(cmd, "cp")
-			})).Return("", "", expectedError) // cp command fails
+				return strings.HasPrefix(cmd, "cp ") && strings.Contains(cmd, inventoryDir)
+			})).Return("", "", expectedError) // copy into the inventory fails
 
 			err := dm.Build(ctx)
 			Expect(err).To(HaveOccurred())
@@ -1718,18 +1745,17 @@ var _ = Describe("Driver", func() {
 			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "-yq", "install", "pkg-config", "linux-headers-5.4.0-42-generic").Return("", "", nil)
 
 			// Mock buildDriverFromSource - Ubuntu specific arguments
-			cmdMock.EXPECT().RunCommand(ctx, "/test/driver/path/install.pl",
-				"--without-depcheck", "--kernel", "5.4.0-42-generic", "--kernel-only", "--build-only",
-				"--with-mlnx-tools", "--without-knem-modules", "--without-iser-modules",
-				"--without-isert-modules", "--without-srp-modules", "--without-kernel-mft-modules",
-				"--without-mlnx-rdma-rxe-modules", "--disable-kmp", "--without-dkms",
-				"--without-xpmem", "--without-xpmem-modules",
-				"--without-mlnx-nfsrdma-modules",
-				"--without-mlnx-nvme-modules").Return("", "", nil)
+			expectDocaSourceStaging(ctx, cmdMock, osMock, constants.OSTypeUbuntu)
+			cmdMock.EXPECT().RunCommand(ctx, docaKernelSupportBin, "--verbose", "--dirty",
+				"--kernel", "5.4.0-42-generic",
+				"--tarfile", docaStagedSourceArchive).Return("Building under /tmp/DOCA.test\n", "", nil)
 
-			// Mock copyBuildArtifacts - debug logging and copy
+			// The build and copy issue five sh -c commands between them: collecting the
+			// tool's packages, the mlnx-tools build and its package, then the listing and
+			// copy in copyBuildArtifacts. The count has to be exact so that this catch-all
+			// is exhausted before the md5sum command below, which needs its own matcher.
 			cmdMock.EXPECT().RunCommand(ctx, "uname", "-m").Return("x86_64", "", nil)
-			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.Anything).Return("", "", nil).Times(4)
+			cmdMock.EXPECT().RunCommand(ctx, "sh", "-c", mock.Anything).Return("", "", nil).Times(5)
 
 			// Mock fixSourceLink
 			cmdMock.EXPECT().RunCommand(ctx, "uname", "-m").Return("x86_64", "", nil)
@@ -1765,14 +1791,10 @@ var _ = Describe("Driver", func() {
 			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "-yq", "install", "pkg-config", "linux-headers-5.4.0-42-generic").Return("", "", nil)
 
 			// Mock buildDriverFromSource - Ubuntu specific arguments
-			cmdMock.EXPECT().RunCommand(ctx, "/test/driver/path/install.pl",
-				"--without-depcheck", "--kernel", "5.4.0-42-generic", "--kernel-only", "--build-only",
-				"--with-mlnx-tools", "--without-knem-modules", "--without-iser-modules",
-				"--without-isert-modules", "--without-srp-modules", "--without-kernel-mft-modules",
-				"--without-mlnx-rdma-rxe-modules", "--disable-kmp", "--without-dkms",
-				"--without-xpmem", "--without-xpmem-modules",
-				"--without-mlnx-nfsrdma-modules",
-				"--without-mlnx-nvme-modules").Return("", "", nil)
+			expectDocaSourceStaging(ctx, cmdMock, osMock, constants.OSTypeUbuntu)
+			cmdMock.EXPECT().RunCommand(ctx, docaKernelSupportBin, "--verbose", "--dirty",
+				"--kernel", "5.4.0-42-generic",
+				"--tarfile", docaStagedSourceArchive).Return("Building under /tmp/DOCA.test\n", "", nil)
 
 			// Mock copyBuildArtifacts - debug logging and copy
 			cmdMock.EXPECT().RunCommand(ctx, "uname", "-m").Return("x86_64", "", nil)
@@ -1843,14 +1865,10 @@ var _ = Describe("Driver", func() {
 			cmdMock.EXPECT().RunCommand(ctx, "apt-get", "-yq", "install", "pkg-config", "linux-headers-5.4.0-42-generic").Return("", "", nil)
 
 			// Mock buildDriverFromSource - Ubuntu specific arguments
-			cmdMock.EXPECT().RunCommand(ctx, "/test/driver/path/install.pl",
-				"--without-depcheck", "--kernel", "5.4.0-42-generic", "--kernel-only", "--build-only",
-				"--with-mlnx-tools", "--without-knem-modules", "--without-iser-modules",
-				"--without-isert-modules", "--without-srp-modules", "--without-kernel-mft-modules",
-				"--without-mlnx-rdma-rxe-modules", "--disable-kmp", "--without-dkms",
-				"--without-xpmem", "--without-xpmem-modules",
-				"--without-mlnx-nfsrdma-modules",
-				"--without-mlnx-nvme-modules").Return("", "", nil)
+			expectDocaSourceStaging(ctx, cmdMock, osMock, constants.OSTypeUbuntu)
+			cmdMock.EXPECT().RunCommand(ctx, docaKernelSupportBin, "--verbose", "--dirty",
+				"--kernel", "5.4.0-42-generic",
+				"--tarfile", docaStagedSourceArchive).Return("Building under /tmp/DOCA.test\n", "", nil)
 
 			// Mock copyBuildArtifacts - debug logging and copy
 			cmdMock.EXPECT().RunCommand(ctx, "uname", "-m").Return("x86_64", "", nil)

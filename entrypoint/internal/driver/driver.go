@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -41,9 +42,32 @@ const (
 	kernelType64k      = "64k"
 
 	flagDisableKMP = "--disable-kmp"
-	dnfCmd         = "dnf"
-	dnfFlagQuiet   = "-q"
-	dnfFlagYes     = "-y"
+
+	// docaKernelSupportBin is NVIDIA's module rebuild tool, shipped in the doca-extra
+	// package. It replaces install.pl, which DOCA 3.6 removes with ofed-scripts.
+	docaKernelSupportBin = "/opt/mellanox/doca/tools/doca-kernel-support"
+	// docaBuildStagingDir collects the packages a build produced. doca-kernel-support
+	// builds in a mktemp directory of its own choosing, so this fixed location is what
+	// decouples copyBuildArtifacts from that unpredictable path.
+	docaBuildStagingDir = "/tmp/doca-driver-build/packages"
+	// docaStagedSourceArchive is the per-build source archive handed to the tool via
+	// --tarfile. It is assembled per build rather than baked into the image, because which
+	// components belong in it depends on runtime configuration.
+	docaStagedSourceArchive = docaBuildStagingDir + "/driver-source.tgz"
+	// osReleasePath is the container's own os-release, which doca-kernel-support reads to
+	// derive DISTRO. Distinct from /host/etc/os-release, which describes the node.
+	osReleasePath = "/etc/os-release"
+
+	// componentMlnxOfedKernel and componentMlnxOfaKernel name the one component every
+	// build selects, which yields the kernel modules package plus the utils package that
+	// owns openibd. The two packaging families spell it differently: the Debian archive
+	// says mlnx-ofed-kernel, the RPM archive mlnx-ofa_kernel.
+	componentMlnxOfedKernel = "mlnx-ofed-kernel"
+	componentMlnxOfaKernel  = "mlnx-ofa_kernel"
+
+	dnfCmd       = "dnf"
+	dnfFlagQuiet = "-q"
+	dnfFlagYes   = "-y"
 
 	moduleIBCore   = "ib_core"
 	moduleMlx5Core = "mlx5_core"
@@ -51,6 +75,54 @@ const (
 )
 
 var kernelModuleNamePattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]*$`)
+
+// docaTopDirPattern matches the line doca-kernel-support prints to announce its working
+// directory ("Building under /tmp/DOCA.XXXXXXXXXX"). The directory comes from mktemp and
+// cannot be set by the caller, so parsing the output is the only way to locate the build.
+var docaTopDirPattern = regexp.MustCompile(`Building under (\S+)`)
+
+// docaExcludableComponents are the kernel components doca-kernel-support builds when it
+// finds their sources and which a build may not want, in the order its rebuild_modules
+// functions list them. The tool offers no way to turn a component off, so anything not
+// selected must be excluded from the archive handed to it. fwctl and knem are listed by
+// the tool but absent from the Debian archive, so there they are skipped anyway.
+//
+// The base component is deliberately not here: every build selects it, so it is never
+// excluded. See docaBaseComponent.
+//
+// This must stay complete: a component missing from here is not excluded and therefore
+// gets built, which is how virtiofs and kernel-mft first reached a node as packages that
+// install.pl never produced.
+//
+// deb_rebuild_modules and rpm_rebuild_modules list the same set in the same order, so one
+// list covers both families.
+var docaExcludableComponents = []string{
+	"iser", "isert", "srp", "mlnx-nfsrdma", "mlnx-nvme",
+	"virtiofs", "fwctl", "knem", "xpmem", "kernel-mft",
+}
+
+// docaBaseComponent returns the always-selected kernel component for the OS's packaging
+// family.
+func docaBaseComponent(osType string) string {
+	if osType == constants.OSTypeUbuntu {
+		return componentMlnxOfedKernel
+	}
+	return componentMlnxOfaKernel
+}
+
+// docaSourceExcludeArg builds the tar --exclude that hides a component's sources from
+// doca-kernel-support, matching however that family's build function looks them up:
+// deb_build globs SOURCES/<name>_*.orig.t*, rpm_build globs SRPMS/<name>-[0-9]*.src.rpm.
+//
+// Both patterns are anchored past the component name so that a prefix does not match a
+// longer sibling — "iser" must not hide "isert". The deb pattern relies on the "_" that
+// separates name from version; the RPM one on the tool's own "-[0-9]" digit anchor.
+func docaSourceExcludeArg(osType, component string) string {
+	if osType == constants.OSTypeUbuntu {
+		return fmt.Sprintf("--exclude=*/SOURCES/%s_*", component)
+	}
+	return fmt.Sprintf("--exclude=*/SRPMS/%s-[0-9]*.src.rpm", component)
+}
 
 // New creates a new instance of the driver manager
 func New(containerMode string, cfg config.Config,
@@ -180,9 +252,17 @@ func (d *driverMgr) Build(ctx context.Context) error {
 
 	// For DTK builds the DTK sidecar handles compilation, so kernel headers are not
 	// needed in this container and package repos may not be reachable from it.
-	// For non-DTK builds, prerequisites must be installed before the cache check
-	// because DKMS still needs kernel headers even when driver packages are cached.
-	if !d.cfg.DtkOcpDriverBuild {
+	installPrereqs := !d.cfg.DtkOcpDriverBuild
+
+	// Prerequisites exist to compile with, and on Ubuntu without DKMS a cache hit
+	// compiles nothing: it installs packages that were built on an earlier run. Waiting
+	// for the cache check therefore keeps a warm cache usable on a node whose package
+	// repos are unreachable, where installing linux-headers-<kernel> would otherwise
+	// fail on headers the run never needed. DKMS still builds on a cache hit, so it
+	// keeps the eager install.
+	deferPrereqs := installPrereqs && osType == constants.OSTypeUbuntu && !d.cfg.UseDKMS
+
+	if installPrereqs && !deferPrereqs {
 		log.V(1).Info("About to install prerequisites", "os", osType, "kernel", kernelVersion)
 		if err := d.installPrerequisitesForOS(ctx, osType, kernelVersion); err != nil {
 			return fmt.Errorf("failed to install prerequisites: %w", err)
@@ -200,6 +280,13 @@ func (d *driverMgr) Build(ctx context.Context) error {
 	} else {
 		// Mark build as incomplete at the start
 		d.driverBuildIncomplete = true
+
+		if deferPrereqs {
+			log.V(1).Info("About to install prerequisites", "os", osType, "kernel", kernelVersion)
+			if err := d.installPrerequisitesForOS(ctx, osType, kernelVersion); err != nil {
+				return fmt.Errorf("failed to install prerequisites: %w", err)
+			}
+		}
 
 		// Wipe any stale inventory directory before rebuilding to prevent RPM file
 		// conflicts when build config changes between runs (e.g. USE_DKMS toggled).
@@ -1121,6 +1208,36 @@ func (d *driverMgr) installRedHatPrerequisites(ctx context.Context, kernelVersio
 
 // buildDriverFromSource builds the driver from source using install.pl
 func (d *driverMgr) buildDriverFromSource(ctx context.Context, driverPath, kernelVersion, osType string) error {
+	// Ubuntu and RedHat build with doca-kernel-support; install.pl is removed in DOCA 3.6.
+	// SLES still takes the install.pl path until it is migrated in turn. OpenShift is
+	// excluded here because its build happens in the DTK sidecar, which has no
+	// doca-extra installed — see the dtk package.
+	//
+	// USE_DKMS also stays on install.pl for now: doca-kernel-support forces WITH_DKMS=0,
+	// so routing DKMS builds through it would quietly produce non-DKMS packages instead of
+	// the DKMS ones the caller asked for. That combination needs its own answer before
+	// install.pl disappears.
+	if d.usesDocaKernelSupport(osType) {
+		return d.buildDriverWithDocaKernelSupport(ctx, driverPath, kernelVersion, osType)
+	}
+	return d.buildDriverWithInstallPl(ctx, driverPath, kernelVersion, osType)
+}
+
+// usesDocaKernelSupport reports whether this build goes through doca-kernel-support rather
+// than install.pl. copyBuildArtifacts has to agree with buildDriverFromSource about this,
+// because the two builders leave their packages in different places.
+func (d *driverMgr) usesDocaKernelSupport(osType string) bool {
+	if d.cfg.UseDKMS {
+		return false
+	}
+	return osType == constants.OSTypeUbuntu || osType == constants.OSTypeRedHat
+}
+
+// buildDriverWithInstallPl builds the driver with the MLNX_OFED install.pl orchestrator.
+//
+// Deprecated: install.pl is removed in DOCA 3.6 along with the ofed-scripts package.
+// Remaining callers are the distros not yet migrated to buildDriverWithDocaKernelSupport.
+func (d *driverMgr) buildDriverWithInstallPl(ctx context.Context, driverPath, kernelVersion, osType string) error {
 	log := logr.FromContextOrDiscard(ctx)
 
 	log.V(1).Info("Building driver from source", "path", driverPath, "kernel", kernelVersion, "os", osType)
@@ -1177,6 +1294,322 @@ func (d *driverMgr) buildDriverFromSource(ctx context.Context, driverPath, kerne
 
 	log.Info("Driver build completed successfully")
 	return nil
+}
+
+// buildDriverWithDocaKernelSupport builds the kernel modules with NVIDIA's
+// doca-kernel-support, the supported replacement for install.pl from DOCA 3.6.
+//
+// Two things differ from install.pl and shape this function. The tool has no
+// --without-<pkg>: components are excluded by omitting their sources from the archive,
+// which stageDriverArchive assembles per build. And it does not build mlnx-tools at all,
+// so that is built separately afterwards to keep the produced package set unchanged.
+func (d *driverMgr) buildDriverWithDocaKernelSupport(ctx context.Context, driverPath, kernelVersion, osType string) error {
+	log := logr.FromContextOrDiscard(ctx)
+
+	log.V(1).Info("Building driver with doca-kernel-support",
+		"source", driverPath, "kernel", kernelVersion, "os", osType)
+
+	d.warnUnsupportedAppendFlags(ctx)
+
+	// On RedHat /etc/os-release is not merely cosmetic: the tool's get_distro turns it into
+	// DISTRO, which selects the KMP dist tag, gates --with-gds, and decides component
+	// availability via is_rpm_built. install.pl was told the answer explicitly with
+	// --distro; the tool has no such flag, so the file is what has to be corrected.
+	//
+	// SLES is excluded because its version metadata does not come from
+	// GetRedHatVersionInfo. It will need its own answer when it migrates.
+	if osType == constants.OSTypeRedHat || osType == constants.OSTypeOpenShift {
+		restore, err := d.alignOsReleaseWithHost(ctx, kernelVersion)
+		if err != nil {
+			return err
+		}
+		defer restore()
+	}
+
+	if err := d.os.RemoveAll(docaBuildStagingDir); err != nil {
+		return fmt.Errorf("failed to clean build staging directory: %w", err)
+	}
+	if err := d.os.MkdirAll(docaBuildStagingDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create build staging directory: %w", err)
+	}
+
+	archive, err := d.stageDriverArchive(ctx, driverPath, osType)
+	if err != nil {
+		return err
+	}
+
+	// --dirty preserves packages/<kver>/<component>/. Without it the tool deletes the loose
+	// packages and leaves only the doca-kernel-repo wrapper, which would then have to be
+	// unpacked again before installDriver could use it.
+	args := make([]string, 0, 6)
+	args = append(args, "--verbose", "--dirty")
+	args = append(args, docaKernelTargetArgs(osType, kernelVersion)...)
+	args = append(args, "--tarfile", archive)
+	stdout, _, err := d.cmd.RunCommand(ctx, docaKernelSupportBin, args...)
+	//nolint:errcheck // best-effort cleanup of a temporary archive
+	defer d.os.RemoveAll(archive)
+
+	// Parse the working directory before checking err: it is chosen by mktemp and only
+	// reported on stdout, and a failed run still leaves logs worth removing.
+	topDir := parseDocaTopDir(stdout)
+	if topDir != "" {
+		defer func() {
+			if rmErr := d.os.RemoveAll(topDir); rmErr != nil {
+				log.V(1).Info("Failed to clean doca-kernel-support work directory",
+					"path", topDir, "error", rmErr)
+			}
+		}()
+	}
+
+	if err != nil {
+		return fmt.Errorf("doca-kernel-support failed to build driver: %w", err)
+	}
+	if topDir == "" {
+		return fmt.Errorf("could not determine doca-kernel-support work directory from its output")
+	}
+
+	// Debug packages are left behind deliberately. The RPM path splits symbols out into a
+	// ~47MB kmod-*-debuginfo and a -debugsource beside a 3MB kmod, and installDriverPackages
+	// installs whatever it finds in the inventory — so without this they would be cached
+	// per kernel and installed onto every node for nothing.
+	//
+	// The emptiness check preserves what the previous cp glob gave for free: a build that
+	// produced nothing has to fail here rather than silently yield an empty inventory.
+	harvest := fmt.Sprintf(`set -e
+files=$(find %s -name '*.%s' ! -name '*debuginfo*' ! -name '*debugsource*')
+[ -n "$files" ] || { echo "doca-kernel-support produced no packages under %s" >&2; exit 1; }
+cp $files %s/
+`, filepath.Join(topDir, "packages", kernelVersion), docaPackageFormat(osType),
+		filepath.Join(topDir, "packages", kernelVersion), docaBuildStagingDir)
+
+	if _, _, err := d.cmd.RunCommand(ctx, "sh", "-c", harvest); err != nil {
+		return fmt.Errorf("failed to collect packages built by doca-kernel-support: %w", err)
+	}
+
+	if err := d.buildMlnxTools(ctx, driverPath, osType); err != nil {
+		return fmt.Errorf("failed to build mlnx-tools: %w", err)
+	}
+
+	log.Info("Driver build completed successfully")
+	return nil
+}
+
+// stageDriverArchive assembles the source archive for this build and returns its path.
+//
+// doca-kernel-support takes an archive (--tarfile), not an extracted tree, and has no
+// --without-<pkg>: it builds every component it finds sources for and merely skips the
+// ones it does not. Component selection therefore means handing it an archive that
+// contains only what this build wants, which is why the archive is assembled here rather
+// than baked into the image — ENABLE_NFSRDMA is a runtime setting and may differ between
+// restarts of the same image.
+func (d *driverMgr) stageDriverArchive(ctx context.Context, driverPath, osType string) (string, error) {
+	log := logr.FromContextOrDiscard(ctx)
+
+	selected := d.selectedDriverComponents(osType)
+	log.V(1).Info("Assembling driver source archive", "components", selected, "os", osType)
+
+	excludes := make([]string, 0, len(docaExcludableComponents))
+	for _, component := range docaExcludableComponents {
+		if !slices.Contains(selected, component) {
+			excludes = append(excludes, docaSourceExcludeArg(osType, component))
+		}
+	}
+
+	// --exclude is positional in tar: it only affects operands that follow it, so the
+	// excludes have to precede -C and the directory being archived.
+	args := make([]string, 0, 5+len(excludes))
+	args = append(args, "czf", docaStagedSourceArchive)
+	args = append(args, excludes...)
+	args = append(args, "-C", filepath.Dir(driverPath), filepath.Base(driverPath))
+
+	if _, _, err := d.cmd.RunCommand(ctx, "tar", args...); err != nil {
+		return "", fmt.Errorf("failed to assemble driver source archive: %w", err)
+	}
+
+	return docaStagedSourceArchive, nil
+}
+
+// selectedDriverComponents returns the kernel components doca-kernel-support should build.
+// This mirrors the exclusions the install.pl invocation used to pass: iser, isert, srp,
+// knem, kernel-mft, mlnx-rdma-rxe and xpmem were always excluded, while mlnx-nfsrdma and
+// mlnx-nvme followed ENABLE_NFSRDMA.
+//
+// mlnx-tools is absent on purpose: doca-kernel-support cannot build it, so buildMlnxTools
+// handles it separately.
+func (d *driverMgr) selectedDriverComponents(osType string) []string {
+	components := []string{docaBaseComponent(osType)}
+	if d.cfg.EnableNfsRdma {
+		components = append(components, "mlnx-nfsrdma", "mlnx-nvme")
+	}
+	return components
+}
+
+// buildMlnxTools builds the mlnx-tools package, which doca-kernel-support does not know
+// about even though install.pl produced it (it was requested with --with-mlnx-tools). It
+// is userspace-only, so building it straight from the source in the archive is enough; no
+// kernel version is involved, which is why the result is identical on every kernel.
+//
+// It matters more than its size suggests: mlnxofedctl ships here, and the
+// restore-on-termination path runs it.
+func (d *driverMgr) buildMlnxTools(ctx context.Context, driverPath, osType string) error {
+	log := logr.FromContextOrDiscard(ctx)
+
+	buildDir := filepath.Join(docaBuildStagingDir, ".mlnx-tools-build")
+	if err := d.os.MkdirAll(buildDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create mlnx-tools build directory: %w", err)
+	}
+	defer func() {
+		if err := d.os.RemoveAll(buildDir); err != nil {
+			log.V(1).Info("Failed to clean mlnx-tools build directory", "error", err)
+		}
+	}()
+
+	format := docaPackageFormat(osType)
+	var script string
+	if osType == constants.OSTypeUbuntu {
+		// The source tarball unpacks to mlnx-tools-<version>/ carrying its own debian/
+		// dir. dpkg-buildpackage writes the .deb to the parent, i.e. buildDir.
+		script = fmt.Sprintf(`set -e
+src=$(ls %[1]s/SOURCES/mlnx-tools_*.orig.t* 2>/dev/null | head -1)
+[ -n "$src" ] || { echo "no mlnx-tools source in %[1]s/SOURCES" >&2; exit 1; }
+tar xf "$src" -C %[2]s
+cd %[2]s/mlnx-tools-*
+dpkg-buildpackage -us -uc -b
+`, driverPath, buildDir)
+	} else {
+		// --rebuild on the source RPM: no kernel defines needed, and _rpmdir puts the
+		// binary package flat in buildDir rather than under an arch subdirectory.
+		script = fmt.Sprintf(`set -e
+srpm=$(ls %[1]s/SRPMS/mlnx-tools-[0-9]*.src.rpm 2>/dev/null | head -1)
+[ -n "$srpm" ] || { echo "no mlnx-tools source in %[1]s/SRPMS" >&2; exit 1; }
+rpmbuild --rebuild --define "_topdir %[2]s" --define "_rpmdir %[2]s" \
+    --define "_build_name_fmt %%%%{NAME}-%%%%{VERSION}-%%%%{RELEASE}.%%%%{ARCH}.rpm" "$srpm"
+`, driverPath, buildDir)
+	}
+
+	if _, _, err := d.cmd.RunCommand(ctx, "sh", "-c", script); err != nil {
+		return fmt.Errorf("failed to build mlnx-tools: %w", err)
+	}
+
+	// Move the results up out of the scratch directory before it is removed. Source
+	// packages are filtered out: only binaries belong in the inventory.
+	if _, _, err := d.cmd.RunCommand(ctx, "sh", "-c",
+		fmt.Sprintf("mv %s/mlnx-tools*.%s %s/", buildDir, format, docaBuildStagingDir)); err != nil {
+		return fmt.Errorf("failed to collect mlnx-tools package: %w", err)
+	}
+
+	log.V(1).Info("mlnx-tools built successfully")
+	return nil
+}
+
+// warnUnsupportedAppendFlags reports user-supplied build flags that cannot be honored.
+//
+// APPEND_DRIVER_BUILD_FLAGS is a public knob whose accepted values are install.pl flags,
+// a vocabulary doca-kernel-support does not share. Passing them through would make it
+// reject the whole invocation, so they are dropped — but named individually in the log,
+// because a stale override that silently changes nothing is worse than one that complains.
+//
+// ENABLE_NFSRDMA is deliberately not reported here: it is still honored, by way of
+// selectedDriverComponents.
+func (d *driverMgr) warnUnsupportedAppendFlags(ctx context.Context) {
+	log := logr.FromContextOrDiscard(ctx)
+
+	for _, flag := range strings.Fields(d.cfg.AppendDriverBuildFlags) {
+		log.Info("Ignoring APPEND_DRIVER_BUILD_FLAGS entry: it is install.pl syntax, which "+
+			"doca-kernel-support does not accept. Component selection is driven by "+
+			"ENABLE_NFSRDMA instead.", "flag", flag)
+	}
+}
+
+// docaPackageFormat returns the package extension doca-kernel-support produces, which is
+// also the $FORMAT it globs its own output with.
+func docaPackageFormat(osType string) string {
+	if osType == constants.OSTypeUbuntu {
+		return "deb"
+	}
+	return "rpm"
+}
+
+// docaKernelTargetArgs selects how the target kernel is named to doca-kernel-support.
+//
+// -k/--kernel is enough on Debian, where the headers package owns
+// /lib/modules/<ver>/build. On EL that symlink belongs to the kernel package itself, which
+// a build container never installs, while kernel-devel provides only /usr/src/kernels/<ver>
+// — so -k fails there with "Could not determine kernel version from source directory" and
+// the source directory has to be named instead.
+//
+// The short -s is deliberate: the tool's getopt spec declares "kernel-source" without a
+// trailing colon, so the long form is parsed as taking no argument and would swallow the
+// following option as its value.
+func docaKernelTargetArgs(osType, kernelVersion string) []string {
+	if osType == constants.OSTypeUbuntu {
+		return []string{"--kernel", kernelVersion}
+	}
+	return []string{"-s", filepath.Join("/usr/src/kernels", kernelVersion)}
+}
+
+// alignOsReleaseWithHost rewrites the container's /etc/os-release ID and VERSION_ID to the
+// host's, and returns a function that puts the original back.
+//
+// This preserves what install.pl was told explicitly via --distro rhel<version>: the host
+// is the authority on the target distro, not the image. The two genuinely can disagree —
+// a rhel9.6 image is buildable and runnable on a 9.8 node — and doca-kernel-support reads
+// only /etc/os-release, in a subshell, with no flag or environment override.
+//
+// ID is deliberately left as the image found it. Every base image on this path is
+// RHEL-derived and already reports "rhel", which is what the tool's distro matching wants;
+// the host's own ID may be "rhcos", which matches nothing.
+func (d *driverMgr) alignOsReleaseWithHost(ctx context.Context, kernelVersion string) (func(), error) {
+	log := logr.FromContextOrDiscard(ctx)
+
+	versionInfo, err := d.host.GetRedHatVersionInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get host version info for driver build: %w", err)
+	}
+	version := redHatDistroVersion(versionInfo, kernelVersion)
+	if version == "" {
+		return nil, fmt.Errorf("could not determine host distro version for driver build")
+	}
+
+	original, err := d.os.ReadFile(osReleasePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", osReleasePath, err)
+	}
+
+	updated := setOsReleaseKey(string(original), "VERSION_ID", version)
+	if err := d.os.WriteFile(osReleasePath, []byte(updated), 0o644); err != nil {
+		return nil, fmt.Errorf("failed to write %s: %w", osReleasePath, err)
+	}
+	log.V(1).Info("Aligned os-release with host for the build", "version", version)
+
+	return func() {
+		if err := d.os.WriteFile(osReleasePath, original, 0o644); err != nil {
+			log.Error(err, "Failed to restore os-release after build", "path", osReleasePath)
+		}
+	}, nil
+}
+
+// setOsReleaseKey replaces a key's value in os-release content, appending the key if it is
+// not already present. Values are emitted quoted, which the format allows everywhere.
+func setOsReleaseKey(content, key, value string) string {
+	line := fmt.Sprintf("%s=%q", key, value)
+	pattern := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `=.*$`)
+	if pattern.MatchString(content) {
+		return pattern.ReplaceAllLiteralString(content, line)
+	}
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	return content + line + "\n"
+}
+
+// parseDocaTopDir extracts the working directory doca-kernel-support reports on stdout.
+func parseDocaTopDir(output string) string {
+	match := docaTopDirPattern.FindStringSubmatch(output)
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
 }
 
 // getBuildFlagsForOS returns OS-specific build flags
@@ -1245,13 +1678,23 @@ func (d *driverMgr) copyBuildArtifacts(ctx context.Context, driverPath, inventor
 
 	switch osType {
 	case constants.OSTypeUbuntu:
-		sourcePath = filepath.Join(driverPath, "DEBS", "ubuntu*", arch, "*.deb")
 		packageType = "deb"
 	case constants.OSTypeSLES, constants.OSTypeRedHat, constants.OSTypeOpenShift:
-		sourcePath = filepath.Join(driverPath, "RPMS", "*", arch, "*.rpm")
 		packageType = "rpm"
 	default:
 		return fmt.Errorf("unsupported OS type for artifact copying: %s", osType)
+	}
+
+	// doca-kernel-support does not write into the source tree the way install.pl did, so
+	// the build step stages its output at a fixed path instead. Which of the two ran is
+	// decided by usesDocaKernelSupport, and this has to follow it.
+	switch {
+	case d.usesDocaKernelSupport(osType):
+		sourcePath = filepath.Join(docaBuildStagingDir, "*."+packageType)
+	case packageType == "deb":
+		sourcePath = filepath.Join(driverPath, "DEBS", "*", arch, "*.deb")
+	default:
+		sourcePath = filepath.Join(driverPath, "RPMS", "*", arch, "*.rpm")
 	}
 
 	log.V(1).Info("Constructed source path", "sourcePath", sourcePath, "packageType", packageType)
@@ -1260,30 +1703,13 @@ func (d *driverMgr) copyBuildArtifacts(ctx context.Context, driverPath, inventor
 	cpCmd := fmt.Sprintf("cp %s %s/", sourcePath, inventoryPath)
 	log.V(1).Info("Executing copy command", "command", cpCmd)
 
-	// Debug: List source directory to see what files exist
-	lsCmd := fmt.Sprintf("ls -la %s", filepath.Dir(sourcePath))
-	log.V(1).Info("Listing source directory", "command", lsCmd)
-	_, _, lsErr := d.cmd.RunCommand(ctx, "sh", "-c", lsCmd)
-	if lsErr != nil {
-		log.V(1).Info("Failed to list source directory", "error", lsErr)
-	}
-
-	// Debug: Try to find files matching the pattern
-	findCmd := fmt.Sprintf("find %s -name '*.deb' 2>/dev/null || echo 'No .deb files found'", filepath.Join(driverPath, "DEBS"))
-	log.V(1).Info("Searching for .deb files", "command", findCmd)
-	_, findOutput, findErr := d.cmd.RunCommand(ctx, "sh", "-c", findCmd)
-	if findErr != nil {
-		log.V(1).Info("Failed to search for .deb files", "error", findErr)
+	// Record what is actually there before copying: a wildcard that matches nothing makes
+	// cp fail with a message that names the pattern rather than the directory contents.
+	if listing, _, err := d.cmd.RunCommand(ctx, "sh", "-c",
+		fmt.Sprintf("ls -la %s", filepath.Dir(sourcePath))); err != nil {
+		log.V(1).Info("Failed to list build output directory", "error", err)
 	} else {
-		log.V(1).Info("Found .deb files", "output", findOutput)
-	}
-
-	// Debug: Check if destination directory exists
-	destExistsCmd := fmt.Sprintf("ls -la %s", inventoryPath)
-	log.V(1).Info("Checking destination directory", "command", destExistsCmd)
-	_, _, destErr := d.cmd.RunCommand(ctx, "sh", "-c", destExistsCmd)
-	if destErr != nil {
-		log.V(1).Info("Destination directory check failed", "error", destErr)
+		log.V(1).Info("Build output directory contents", "listing", listing)
 	}
 
 	_, _, err := d.cmd.RunCommand(ctx, "sh", "-c", cpCmd)

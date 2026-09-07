@@ -92,6 +92,7 @@ ARG D_CONTAINER_VER
 ARG D_OFED_SRC_DOWNLOAD_PATH
 ARG STIG_COMPLIANT
 ARG D_OS
+ARG D_ARCH
 
 # Stage args
 ARG D_OFED_BASE_URL="https://linux.mellanox.com/public/repo/doca/${D_DOCA_VERSION}/SOURCES/mlnx_ofed"
@@ -115,9 +116,12 @@ RUN --mount=type=bind,from=rhsm,source=.,target=/etc/pki/entitlement-host \
     dnf install -y --releasever=${RELEASE_VER} \
 # Driver build requirements
     autoconf python3-devel ethtool automake pciutils libtool hostname dracut \
-# Build tools needed by install.pl at runtime (avoids subscription-gated dnf at container start)
+# Build tools needed by the driver build at runtime (avoids subscription-gated dnf at
+# container start). createrepo_c, binutils and kernel-abi-stablelists are what
+# doca-kernel-support's rpm_install_build_deps checks for; it installs whatever is missing
+# itself, which is exactly the network access this list exists to avoid.
     elfutils-libelf-devel kernel-rpm-macros numactl-libs lsof rpm-build patch \
-    gcc make bison flex \
+    gcc make bison flex createrepo_c binutils kernel-abi-stablelists \
 # DKMS is always installed in the dynamic (sources) image; install.pl is invoked at
 # container runtime and may build DKMS-enabled packages. Inherited by driver-builder too.
     dkms
@@ -131,6 +135,33 @@ RUN if file ${D_OFED_SRC_ARCHIVE} | grep compressed; then \
   else \
     mv ${D_OFED_SRC_ARCHIVE}/MLNX_OFED_SRC-${D_OFED_VERSION} . ; \
   fi
+
+# Install doca-kernel-support, the supported replacement for install.pl.
+#
+# doca-extra Requires doca-ofed-source, which supplies get_mlnx_ofed_version (called
+# unconditionally by doca-kernel-support) plus its own copy of the source archive. We build
+# from our own pinned archive via -t, so that copy is deleted: it is ~42MB of duplicate,
+# and it is also the tool's *default* source, so removing it turns a dropped -t into a
+# loud failure rather than a silent build of the wrong OFED version.
+# get_mlnx_ofed_version must be kept -- the tool dies without it.
+#
+# The DOCA RPM repos are published per major version (rhel8, rhel9, rhel10), not per minor,
+# so the URL is built from the major rather than from D_OS directly.
+#
+# Note there is no MLNX_KO_NO_STRIP patch here, unlike Ubuntu: that assignment lives in the
+# tool's deb_build only, and the RPM path already strips into a separate -debuginfo package.
+RUN set -eux; \
+    MAJOR_VER=$(echo ${D_OS} | sed 's/rhel\([0-9]*\).*/\1/'); \
+    RELEASE_VER=$(echo ${D_OS} | sed 's/rhel//'); \
+    DOCA_REPO_URL="https://linux.mellanox.com/public/repo/doca/${D_DOCA_VERSION}/rhel${MAJOR_VER}/${D_ARCH}"; \
+    rpm --import "${DOCA_REPO_URL}/RPM-GPG-KEY-doca"; \
+    printf '[doca]\nname=DOCA\nbaseurl=%s\nenabled=1\ngpgcheck=1\ngpgkey=%s/RPM-GPG-KEY-doca\n' \
+        "${DOCA_REPO_URL}" "${DOCA_REPO_URL}" > /etc/yum.repos.d/doca.repo; \
+    dnf install -y --releasever=${RELEASE_VER} doca-extra; \
+    rm -f /opt/mellanox/doca/tools/resources/MLNX_OFED_*.tgz; \
+    dnf clean all; \
+    test -x /opt/mellanox/doca/tools/doca-kernel-support; \
+    test -x /opt/mellanox/doca/tools/get_mlnx_ofed_version
 
 WORKDIR /root
 ADD ./entrypoint.sh /root/entrypoint.sh

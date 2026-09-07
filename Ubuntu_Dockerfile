@@ -80,6 +80,7 @@ FROM base AS driver-src
 
 # Inherited global args
 ARG D_OS
+ARG D_ARCH
 ARG D_DOCA_VERSION
 ARG D_OFED_VERSION
 ARG D_OFED_SRC_DOWNLOAD_PATH
@@ -87,6 +88,11 @@ ARG D_OFED_SRC_DOWNLOAD_PATH
 # Stage args
 ARG D_OFED_BASE_URL="https://linux.mellanox.com/public/repo/doca/${D_DOCA_VERSION}/SOURCES/mlnx_ofed"
 ARG D_OFED_SRC_TYPE="debian-"
+
+# Kept separate from D_OFED_BASE_URL on purpose: that one is routinely overridden to point
+# at a local *.tgz for internal builds, and the DOCA package repo still has to be reachable
+# when it is.
+ARG D_DOCA_REPO_URL="https://linux.mellanox.com/public/repo/doca/${D_DOCA_VERSION}/${D_OS}/${D_ARCH}"
 
 ARG D_OFED_SRC_ARCHIVE="MLNX_OFED_SRC-${D_OFED_SRC_TYPE}${D_OFED_VERSION}.tgz"
 ARG D_OFED_URL_PATH="${D_OFED_BASE_URL}/${D_OFED_SRC_ARCHIVE}"  # although argument name says URL, local `*.tgz` compressed files may also be used (intended for internal use)
@@ -123,6 +129,46 @@ RUN if file ${D_OFED_SRC_ARCHIVE} | grep compressed; then \
   else \
     mv ${D_OFED_SRC_ARCHIVE}/MLNX_OFED_SRC-${D_OFED_VERSION} . ; \
   fi
+
+# Install doca-kernel-support, the supported replacement for install.pl.
+#
+# doca-extra Depends on doca-ofed-source, which supplies get_mlnx_ofed_version (called
+# unconditionally by doca-kernel-support) plus its own copy of the source archive. We build
+# from our own pinned archive via -t, so that copy is deleted: it is ~42MB of duplicate,
+# and it is also the tool's *default* source, so removing it turns a dropped -t into a loud
+# failure rather than a silent build of the wrong OFED version. The glob matches the tool's
+# own (MLNX_OFED_*.tgz) so a vendor rename cannot leave the fallback in place.
+# get_mlnx_ofed_version must be kept -- the tool dies without it.
+RUN set -eux; \
+    curl -fsSL "${D_DOCA_REPO_URL}/doca_keyring.gpg" -o /usr/share/keyrings/doca.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/doca.gpg] ${D_DOCA_REPO_URL}/ ./" \
+        > /etc/apt/sources.list.d/doca.list; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get -yq install doca-extra; \
+    rm -f /opt/mellanox/doca/tools/resources/MLNX_OFED_*.tgz; \
+    rm -rf /var/lib/apt/lists/*; \
+    test -x /opt/mellanox/doca/tools/doca-kernel-support; \
+    test -x /opt/mellanox/doca/tools/get_mlnx_ofed_version
+
+# deb_build() hardcodes MLNX_KO_NO_STRIP="1", opting out of the stripping debian/rules does
+# by default. That inflates mlnx-ofed-kernel-modules from 53MB to 131MB (571MB installed),
+# so clearing it restores parity with what install.pl produced. The same override_dh_strip
+# target also hosts the WITH_MOD_SIGN hook, so this is a prerequisite for ever signing here.
+#
+# Patching at image build time rather than at runtime is deliberate: if a future doca-extra
+# drops this assignment, the image build fails loudly instead of every node silently
+# shipping a 131MB package.
+RUN set -eux; \
+    grep -q 'MLNX_KO_NO_STRIP="1"' /opt/mellanox/doca/tools/doca-kernel-support; \
+    sed -i 's/MLNX_KO_NO_STRIP="1"/MLNX_KO_NO_STRIP="0"/' \
+        /opt/mellanox/doca/tools/doca-kernel-support; \
+    grep -q 'MLNX_KO_NO_STRIP="0"' /opt/mellanox/doca/tools/doca-kernel-support
+
+# Note: component selection is deliberately NOT done here. doca-kernel-support has no
+# --without-<pkg> and instead skips components whose sources are absent, but which
+# components are wanted depends on ENABLE_NFSRDMA, which is a runtime setting that can
+# differ between pod restarts of the same image. The archive it builds from is therefore
+# assembled at runtime; see buildDriverWithDocaKernelSupport.
 
 WORKDIR /root
 
