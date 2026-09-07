@@ -1,0 +1,18 @@
+# Build artifacts produced by the POC scripts in poc/dks. The scripts are tracked;
+# their output is hundreds of MB of RPMs, debs and build logs.
+poc/dks/out/
+poc/dks/out-*/
+
+# Extracted MLNX_OFED source trees used as POC input.
+ofed/
+
+# Scratch run logs kept while iterating on a node. Not evidence anyone else can use:
+# the findings they supported are written up in docs/install-pl-deprecation-plan.md.
+*.log
+*.txtx
+/*.txt
+*.diff
+*.csv
+ubuntu.build
+
+entrypoint/.golangci-lint-cache/

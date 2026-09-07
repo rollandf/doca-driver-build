@@ -50,6 +50,8 @@ type Config struct {
 	DtkOcpCompiledDriverVer       string `env:"DTK_OCP_COMPILED_DRIVER_VER"`
 	DtkOcpStartCompileFlag        string `env:"DTK_OCP_START_COMPILE_FLAG"`
 	DtkOcpDoneCompileFlag         string `env:"DTK_OCP_DONE_COMPILE_FLAG"`
+	DtkOcpKernelVer               string `env:"DTK_OCP_KERNEL_VER"`
+	DtkOcpDistro                  string `env:"DTK_OCP_DISTRO"`
 	AppendDriverBuildFlags        string `env:"APPEND_DRIVER_BUILD_FLAGS"`
 	NvidiaNicDriversInventoryPath string `env:"NVIDIA_NIC_DRIVERS_INVENTORY_PATH"`
 

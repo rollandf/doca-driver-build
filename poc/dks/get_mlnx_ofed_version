@@ -1,0 +1,15 @@
+#!/bin/sh
+# POC harness artifact -- NOT a production workaround.
+#
+# doca-kernel-support line 5 runs this unconditionally under `set -e`:
+#     DOCA_VERSION=`/opt/mellanox/doca/tools/get_mlnx_ofed_version`
+#
+# The real script is shipped by doca-ofed-source, which doca-extra depends on
+# (Depends: pciutils, doca-ofed-source (>= 26.07)). This harness extracts
+# doca-extra standalone from its package instead of installing it, so the
+# dependency is never pulled in and the file is absent. Installing doca-extra
+# normally needs no stub at all.
+#
+# The shipped implementation is itself a generated stub echoing a baked-in
+# version string, so matching that behaviour here is faithful, not a shortcut.
+echo "${OFED_VERSION:-26.07-0.7.7.0}"

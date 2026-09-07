@@ -39,4 +39,16 @@ const (
 	DtkOcpBuildScriptPath    = "/root/dtk_nic_driver_build.sh"
 	DtkStartCompileFlag      = "dtk_start_compile"
 	DtkDoneCompileFlagPrefix = "dtk_done_compile_"
+
+	// Layout of the DTK shared volume, below <DTK_OCP_NIC_SHARED_DIR>/<kernel>. The driver
+	// container writes everything except DtkPackagesDirName, which the driver-toolkit
+	// sidecar writes and the driver container then harvests into the inventory.
+	//
+	// The sidecar cannot install doca-extra -- it has no DOCA repo and no entitlements --
+	// so the tool, its resources, and the build dependencies its self-installing dependency
+	// check would otherwise reach for all arrive here as files.
+	DtkSourceArchiveName = "driver-source.tgz"
+	DtkToolsDirName      = "tools"
+	DtkBuildDepsDirName  = "build-deps"
+	DtkPackagesDirName   = "packages"
 )

@@ -28,11 +28,18 @@ import (
 	"github.com/go-logr/logr"
 
 	"github.com/Mellanox/doca-driver-build/entrypoint/internal/constants"
+	"github.com/Mellanox/doca-driver-build/entrypoint/internal/utils/doca"
 	hostutils "github.com/Mellanox/doca-driver-build/entrypoint/internal/utils/host"
 )
 
+// dtkBuildDepsImageDir holds the RPMs the driver-toolkit cannot install for itself,
+// downloaded into this image at build time on a subscription-entitled host. See the
+// dtk-deps step in RHEL_Dockerfile. A variable only so tests can point it somewhere
+// writable.
+var dtkBuildDepsImageDir = "/opt/mellanox/dtk-deps"
+
 // buildDriverDTK orchestrates the driver build using the OpenShift Driver Toolkit (DTK)
-func (d *driverMgr) buildDriverDTK(ctx context.Context, kernelVersion, inventoryPath string) error {
+func (d *driverMgr) buildDriverDTK(ctx context.Context, kernelVersion, inventoryPath, osType string) error {
 	log := logr.FromContextOrDiscard(ctx)
 	log.Info("Starting DTK driver build")
 
@@ -52,7 +59,8 @@ func (d *driverMgr) buildDriverDTK(ctx context.Context, kernelVersion, inventory
 	if _, err := d.os.Stat(doneFlagPath); os.IsNotExist(err) {
 		log.Info("DTK build not done, setting up build")
 
-		if err := d.dtkSetupDriverBuild(ctx, dtkSharedDir, startFlagPath, doneFlagPath, kernelVersion); err != nil {
+		if err := d.dtkSetupDriverBuild(ctx, dtkSharedDir, startFlagPath, doneFlagPath,
+			kernelVersion, osType); err != nil {
 			return fmt.Errorf("failed to setup DTK build: %w", err)
 		}
 
@@ -64,7 +72,7 @@ func (d *driverMgr) buildDriverDTK(ctx context.Context, kernelVersion, inventory
 	}
 
 	// Finalize build (copy artifacts)
-	if err := d.dtkFinalizeDriverBuild(ctx, dtkSharedDir, inventoryPath); err != nil {
+	if err := d.dtkFinalizeDriverBuild(ctx, dtkSharedDir, inventoryPath, osType); err != nil {
 		return fmt.Errorf("failed to finalize DTK build: %w", err)
 	}
 
@@ -81,7 +89,9 @@ func sanitizeKernelVersion(version string) string {
 }
 
 // dtkSetupDriverBuild prepares the shared directory and script for DTK build
-func (d *driverMgr) dtkSetupDriverBuild(ctx context.Context, sharedDir, startFlagPath, doneFlagPath, kernelVersion string) error {
+func (d *driverMgr) dtkSetupDriverBuild(ctx context.Context,
+	sharedDir, startFlagPath, doneFlagPath, kernelVersion, osType string,
+) error {
 	log := logr.FromContextOrDiscard(ctx)
 	log.Info("Setting up DTK driver build", "sharedDir", sharedDir)
 
@@ -90,21 +100,23 @@ func (d *driverMgr) dtkSetupDriverBuild(ctx context.Context, sharedDir, startFla
 		return fmt.Errorf("failed to create shared directory: %w", err)
 	}
 
-	// Copy driver sources to shared directory
-	// Matches bash: cp -r ${NVIDIA_NIC_DRIVER_PATH} ${DTK_OCP_NIC_SHARED_DIR}/
-	srcDir := d.cfg.NvidiaNicDriverPath
-	// Use expected directory name format to ensure DTK build script finds it
-	expectedName := fmt.Sprintf("MLNX_OFED_SRC-%s", d.cfg.NvidiaNicDriverVer)
-	destDir := filepath.Join(sharedDir, expectedName)
-
-	// Clean up destination if it exists to avoid nesting (cp -r behavior)
-	if err := d.os.RemoveAll(destDir); err != nil {
-		return fmt.Errorf("failed to clean up destination directory: %w", err)
+	// Hand the sidecar a source archive rather than a source tree. doca-kernel-support
+	// takes --tarfile, and since it has no --without-<pkg>, which components the archive
+	// contains is how they are selected -- so it must be assembled here, where
+	// ENABLE_NFSRDMA is known, and not in the sidecar.
+	archivePath := filepath.Join(sharedDir, constants.DtkSourceArchiveName)
+	if _, err := d.stageDriverArchive(ctx, d.cfg.NvidiaNicDriverPath, osType, archivePath); err != nil {
+		return err
 	}
 
-	log.Info("Copying driver sources", "from", srcDir, "to", destDir)
-	if err := d.copyDir(ctx, srcDir, destDir); err != nil {
-		return fmt.Errorf("failed to copy driver sources: %w", err)
+	if err := d.dtkStageBuildTooling(ctx, sharedDir); err != nil {
+		return err
+	}
+
+	// The sidecar harvests into this directory, so it has to exist before the start flag
+	// goes up.
+	if err := d.os.MkdirAll(filepath.Join(sharedDir, constants.DtkPackagesDirName), 0o755); err != nil {
+		return fmt.Errorf("failed to create shared packages directory: %w", err)
 	}
 
 	// Copy entrypoint binary to shared directory
@@ -116,23 +128,26 @@ func (d *driverMgr) dtkSetupDriverBuild(ctx context.Context, sharedDir, startFla
 		return fmt.Errorf("failed to copy entrypoint binary: %w", err)
 	}
 
-	// Create dtk.env file
-	// Get append flags
-	appendFlags, err := d.getDTKAppendDriverBuildFlags(ctx, kernelVersion)
+	// Create dtk.env file. Both ends of this file are the same binary: the sidecar runs the
+	// entrypoint copied above, so the field set can change freely without a compatibility window.
+	distro, err := d.dtkDistro(ctx, kernelVersion)
 	if err != nil {
 		return err
 	}
-	appendFlagsStr := strings.Join(appendFlags, " ")
+	appendFlagsStr := strings.Join(d.getAppendDriverBuildFlags(constants.OSTypeRedHat), " ")
 
 	envContent := fmt.Sprintf(`export DTK_OCP_NIC_SHARED_DIR="%s"
 export DTK_OCP_COMPILED_DRIVER_VER="%s"
 export DTK_OCP_START_COMPILE_FLAG="%s"
 export DTK_OCP_DONE_COMPILE_FLAG="%s"
+export DTK_OCP_KERNEL_VER="%s"
+export DTK_OCP_DISTRO="%s"
 export APPEND_DRIVER_BUILD_FLAGS="%s"
 export USE_NEW_ENTRYPOINT="true"
 export NVIDIA_NIC_DRIVER_VER="%s"
 export USE_DKMS="%v"
-`, sharedDir, d.cfg.NvidiaNicDriverVer, startFlagPath, doneFlagPath, appendFlagsStr, d.cfg.NvidiaNicDriverVer, d.cfg.UseDKMS)
+`, sharedDir, d.cfg.NvidiaNicDriverVer, startFlagPath, doneFlagPath,
+		kernelVersion, distro, appendFlagsStr, d.cfg.NvidiaNicDriverVer, d.cfg.UseDKMS)
 
 	envPath := filepath.Join(sharedDir, "dtk.env")
 	if err := d.os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
@@ -157,22 +172,81 @@ export USE_DKMS="%v"
 	return nil
 }
 
-func (d *driverMgr) getDTKAppendDriverBuildFlags(ctx context.Context, kernelVersion string) ([]string, error) {
-	appendFlags := d.getAppendDriverBuildFlags(constants.OSTypeRedHat)
-	appendFlags = append(appendFlags, "--kernel", kernelVersion)
+// dtkStageBuildTooling puts doca-kernel-support and the build dependencies the
+// driver-toolkit lacks onto the shared volume.
+//
+// The sidecar cannot install doca-extra: it has no DOCA repo, and no entitlements for the
+// RHEL repos either. Both halves of that gap are answered here with files. The tool's own
+// three files come from this image, where doca-extra is installed; the RPMs were fetched
+// at image build time on an entitled host.
+func (d *driverMgr) dtkStageBuildTooling(ctx context.Context, sharedDir string) error {
+	log := logr.FromContextOrDiscard(ctx)
 
+	toolsDir := filepath.Join(sharedDir, constants.DtkToolsDirName)
+	// The layout under toolsDir mirrors doca.ToolsDir exactly, because RES_FOLDER is an
+	// absolute constant inside the script: the sidecar has to reconstruct that path, so
+	// what it copies from has to have the same shape.
+	if err := d.os.MkdirAll(filepath.Join(toolsDir, filepath.Base(doca.ResourcesDir)), 0o755); err != nil {
+		return fmt.Errorf("failed to create shared tools directory: %w", err)
+	}
+
+	for _, src := range doca.StagedFiles {
+		rel, err := filepath.Rel(doca.ToolsDir, src)
+		if err != nil {
+			return fmt.Errorf("failed to resolve staged tool path %s: %w", src, err)
+		}
+		dest := filepath.Join(toolsDir, rel)
+		log.V(1).Info("Staging build tool", "from", src, "to", dest)
+		if _, _, err := d.cmd.RunCommand(ctx, "cp", "-f", src, dest); err != nil {
+			return fmt.Errorf("failed to stage %s: %w", src, err)
+		}
+	}
+
+	depsDir := filepath.Join(sharedDir, constants.DtkBuildDepsDirName)
+	if err := d.os.MkdirAll(depsDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create shared build dependency directory: %w", err)
+	}
+
+	entries, err := d.os.ReadDir(dtkBuildDepsImageDir)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %w", dtkBuildDepsImageDir, err)
+	}
+
+	staged := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".rpm") {
+			continue
+		}
+		if _, _, err := d.cmd.RunCommand(ctx, "cp", "-f",
+			filepath.Join(dtkBuildDepsImageDir, entry.Name()),
+			filepath.Join(depsDir, entry.Name())); err != nil {
+			return fmt.Errorf("failed to stage build dependency %s: %w", entry.Name(), err)
+		}
+		staged++
+	}
+
+	if staged == 0 {
+		return fmt.Errorf("no build dependency RPMs in %s: the image was built without them, "+
+			"and the driver-toolkit cannot install them itself", dtkBuildDepsImageDir)
+	}
+	log.V(1).Info("Staged build dependencies for the DTK sidecar", "count", staged)
+
+	return nil
+}
+
+// dtkDistro resolves the distro tag the sidecar builds against, e.g. "rhel9.8".
+func (d *driverMgr) dtkDistro(ctx context.Context, kernelVersion string) (string, error) {
 	versionInfo, err := d.host.GetRedHatVersionInfo(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get RedHat version info for DTK driver build: %w", err)
+		return "", fmt.Errorf("failed to get RedHat version info for DTK driver build: %w", err)
 	}
 
 	distroVersion := redHatDistroVersion(versionInfo, kernelVersion)
 	if distroVersion == "" {
-		return nil, fmt.Errorf("failed to determine RHEL distro version for DTK driver build")
+		return "", fmt.Errorf("failed to determine RHEL distro version for DTK driver build")
 	}
 
-	appendFlags = append(appendFlags, "--distro", "rhel"+distroVersion)
-	return appendFlags, nil
+	return "rhel" + distroVersion, nil
 }
 
 func redHatDistroVersion(versionInfo *hostutils.RedhatVersionInfo, kernelVersion string) string {
@@ -227,8 +301,12 @@ func (d *driverMgr) dtkWaitForBuild(ctx context.Context, doneFlagPath string) er
 	return fmt.Errorf("timeout (%d sec) awaiting DTK compilation, %s not found", totalSleepSec, doneFlagPath)
 }
 
-// dtkFinalizeDriverBuild copies the built artifacts back to the inventory
-func (d *driverMgr) dtkFinalizeDriverBuild(ctx context.Context, sharedDir, inventoryPath string) error {
+// dtkFinalizeDriverBuild copies the built artifacts back to the inventory.
+//
+// The sidecar leaves its packages in a fixed directory on the shared volume rather than
+// in the build tree: doca-kernel-support builds under a mktemp directory of its own
+// choosing that only it can name, so harvesting is its job, and this end just collects.
+func (d *driverMgr) dtkFinalizeDriverBuild(ctx context.Context, sharedDir, inventoryPath, osType string) error {
 	log := logr.FromContextOrDiscard(ctx)
 	log.Info("Finalizing DTK driver build", "inventoryPath", inventoryPath)
 
@@ -236,46 +314,17 @@ func (d *driverMgr) dtkFinalizeDriverBuild(ctx context.Context, sharedDir, inven
 		return err
 	}
 
-	// Construct path to RPMs in shared dir
-	// Matches bash: rpms_path="${DTK_OCP_NIC_SHARED_DIR}/MLNX_OFED_SRC-${NVIDIA_NIC_DRIVER_VER}/RPMS/redhat-release-*/${ARCH}/"
-	arch := d.getArchitecture(ctx)
-	srcDirName := fmt.Sprintf("MLNX_OFED_SRC-%s", d.cfg.NvidiaNicDriverVer)
-	// We need to handle the wildcard "redhat-release-*"
-	rpmsBase := filepath.Join(sharedDir, srcDirName, "RPMS")
-
-	// Find the redhat-release directory
-	entries, err := d.os.ReadDir(rpmsBase)
+	packagesDir := filepath.Join(sharedDir, constants.DtkPackagesDirName)
+	files, err := filepath.Glob(filepath.Join(packagesDir, "*."+docaPackageFormat(osType)))
 	if err != nil {
-		return fmt.Errorf("failed to read RPMS directory %s: %w", rpmsBase, err)
-	}
-
-	var redhatDir string
-	for _, entry := range entries {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), "redhat-release-") {
-			redhatDir = entry.Name()
-			break
-		}
-	}
-
-	if redhatDir == "" {
-		return fmt.Errorf("redhat-release directory not found in %s", rpmsBase)
-	}
-
-	rpmsPath := filepath.Join(rpmsBase, redhatDir, arch)
-
-	// Copy RPMs
-	// Matches bash: cp -rf ${rpms_path}/*.rpm ${driver_inventory_path}/
-	log.Info("Copying RPMs", "from", rpmsPath, "to", inventoryPath)
-
-	// Copy RPMs using glob to avoid shell injection
-	rpmsGlob := filepath.Join(rpmsPath, "*.rpm")
-	files, err := filepath.Glob(rpmsGlob)
-	if err != nil {
-		return fmt.Errorf("failed to glob RPM files: %w", err)
+		return fmt.Errorf("failed to glob package files: %w", err)
 	}
 	if len(files) == 0 {
-		return fmt.Errorf("no RPM files found in %s", rpmsPath)
+		return fmt.Errorf("no packages found in %s", packagesDir)
 	}
+
+	log.Info("Copying packages built by the DTK sidecar",
+		"from", packagesDir, "to", inventoryPath, "count", len(files))
 
 	for _, file := range files {
 		dest := filepath.Join(inventoryPath, filepath.Base(file))
@@ -284,13 +333,12 @@ func (d *driverMgr) dtkFinalizeDriverBuild(ctx context.Context, sharedDir, inven
 		}
 	}
 
-	return nil
-}
+	// mlnx-tools is built here rather than in the sidecar. doca-kernel-support does not
+	// build it at all, and it is userspace-only, so it needs neither the target kernel's
+	// headers nor anything else the sidecar exists to provide.
+	if err := d.buildMlnxTools(ctx, d.cfg.NvidiaNicDriverPath, osType, inventoryPath); err != nil {
+		return fmt.Errorf("failed to build mlnx-tools: %w", err)
+	}
 
-// copyDir copies a directory recursively
-func (d *driverMgr) copyDir(ctx context.Context, src, dest string) error {
-	// Using cp -rT to treat dest as a normal file (directory)
-	// This ensures contents of src are copied into dest, not src into dest/src
-	_, _, err := d.cmd.RunCommand(ctx, "cp", "-rT", src, dest)
-	return err
+	return nil
 }

@@ -29,22 +29,65 @@ import (
 	"github.com/stretchr/testify/mock"
 
 	"github.com/Mellanox/doca-driver-build/entrypoint/internal/config"
+	"github.com/Mellanox/doca-driver-build/entrypoint/internal/constants"
 	cmdMockPkg "github.com/Mellanox/doca-driver-build/entrypoint/internal/utils/cmd/mocks"
+	"github.com/Mellanox/doca-driver-build/entrypoint/internal/utils/doca"
 )
+
+const testKernelVer = "5.14.0-687.13.1.el9_8.x86_64"
+
+func testConfig(t *testing.T, sharedDir string) config.Config {
+	t.Helper()
+	return config.Config{
+		DtkOcpStartCompileFlag:  filepath.Join(sharedDir, "dtk_start_compile"),
+		DtkOcpDoneCompileFlag:   filepath.Join(sharedDir, "dtk_done_compile"),
+		DtkOcpCompiledDriverVer: "1.0.0",
+		DtkOcpNicSharedDir:      sharedDir,
+		DtkOcpKernelVer:         testKernelVer,
+		DtkOcpDistro:            "rhel9.8",
+	}
+}
+
+// stageStubTooling writes the files the driver container would have put on the shared
+// volume, so the sidecar has something to install.
+func stageStubTooling(t *testing.T, sharedDir string) {
+	t.Helper()
+
+	depsDir := filepath.Join(sharedDir, constants.DtkBuildDepsDirName)
+	assert.NoError(t, os.MkdirAll(depsDir, 0o755))
+	assert.NoError(t, os.WriteFile(filepath.Join(depsDir, "createrepo_c-0.20.1.x86_64.rpm"), nil, 0o644))
+
+	toolsDir := filepath.Join(sharedDir, constants.DtkToolsDirName)
+	assert.NoError(t, os.MkdirAll(filepath.Join(toolsDir, "resources"), 0o755))
+}
+
+// expectToolingInstall mocks the staging step. createrepoErr controls whether the sidecar
+// already has createrepo, which is what decides if the staged RPMs get installed.
+func expectToolingInstall(cmdMock *cmdMockPkg.Interface, sharedDir string, createrepoErr error) {
+	cmdMock.EXPECT().RunCommand(mock.Anything, "rpm", "-q", "--whatprovides", "createrepo").
+		Return("", "", createrepoErr)
+
+	if createrepoErr != nil {
+		cmdMock.EXPECT().RunCommand(mock.Anything, "rpm", "-Uvh", "--replacepkgs",
+			filepath.Join(sharedDir, constants.DtkBuildDepsDirName, "createrepo_c-0.20.1.x86_64.rpm")).
+			Return("", "", nil)
+	}
+
+	cmdMock.EXPECT().RunCommand(mock.Anything, "mkdir", "-p", doca.ResourcesDir).Return("", "", nil)
+
+	stagedTools := filepath.Join(sharedDir, constants.DtkToolsDirName)
+	for _, dest := range doca.StagedFiles {
+		rel, err := filepath.Rel(doca.ToolsDir, dest)
+		if err != nil {
+			panic(err)
+		}
+		cmdMock.EXPECT().RunCommand(mock.Anything, "install", "-m", "0755",
+			filepath.Join(stagedTools, rel), dest).Return("", "", nil)
+	}
+}
 
 func TestRunBuild(t *testing.T) {
 	log := logr.Discard()
-	tempDir := t.TempDir()
-
-	startFlag := filepath.Join(tempDir, "dtk_start_compile")
-	doneFlag := filepath.Join(tempDir, "dtk_done_compile")
-
-	cfg := config.Config{
-		DtkOcpStartCompileFlag:  startFlag,
-		DtkOcpDoneCompileFlag:   doneFlag,
-		DtkOcpCompiledDriverVer: "1.0.0",
-		DtkOcpNicSharedDir:      tempDir,
-	}
 
 	t.Run("should fail if flags are not set", func(t *testing.T) {
 		err := RunBuild(context.Background(), log, config.Config{}, nil)
@@ -52,120 +95,132 @@ func TestRunBuild(t *testing.T) {
 		assert.Contains(t, err.Error(), "required DTK environment variables not set")
 	})
 
-	t.Run("should fail if perl installation fails", func(t *testing.T) {
+	t.Run("should reject a dtk.env without the kernel version", func(t *testing.T) {
+		cfg := testConfig(t, t.TempDir())
+		cfg.DtkOcpKernelVer = ""
+
+		err := RunBuild(context.Background(), log, cfg, nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "required DTK environment variables not set")
+	})
+
+	t.Run("should fail if the staged build dependencies are missing", func(t *testing.T) {
+		sharedDir := t.TempDir()
+		cfg := testConfig(t, sharedDir)
+
 		cmdMock := cmdMockPkg.NewInterface(t)
-		cmdMock.EXPECT().RunCommand(mock.Anything, "dnf", "install", "-y", "perl").Return("", "", errors.New("dnf failed"))
+		cmdMock.EXPECT().RunCommand(mock.Anything, "rpm", "-q", "--whatprovides", "createrepo").
+			Return("", "", errors.New("not installed"))
+
+		assert.NoError(t, os.WriteFile(cfg.DtkOcpStartCompileFlag, nil, 0o644))
 
 		err := RunBuild(context.Background(), log, cfg, cmdMock)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "failed to install perl")
+		assert.Contains(t, err.Error(), "no build dependency RPMs staged")
 	})
 
-	t.Run("should fail if build dependencies installation fails", func(t *testing.T) {
+	t.Run("should build with doca-kernel-support and publish packages to the shared volume",
+		func(t *testing.T) {
+			sharedDir := t.TempDir()
+			cfg := testConfig(t, sharedDir)
+			stageStubTooling(t, sharedDir)
+
+			cmdMock := cmdMockPkg.NewInterface(t)
+			expectToolingInstall(cmdMock, sharedDir, errors.New("not installed"))
+
+			// Create start flag after a short delay
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				f, err := os.Create(cfg.DtkOcpStartCompileFlag)
+				assert.NoError(t, err)
+				f.Close()
+			}()
+
+			topDir := "/tmp/DOCA.abc123"
+			cmdMock.EXPECT().RunCommand(mock.Anything, doca.KernelSupportBin,
+				"--verbose", "--dirty",
+				"-s", "/usr/src/kernels/"+testKernelVer,
+				"--tarfile", filepath.Join(sharedDir, constants.DtkSourceArchiveName)).
+				Return("Building under "+topDir+"\n", "", nil)
+
+			cmdMock.EXPECT().RunCommand(mock.Anything, "sh", "-c",
+				doca.HarvestScript(doca.PackagesDir(topDir, testKernelVer), "rpm",
+					filepath.Join(sharedDir, constants.DtkPackagesDirName))).
+				Return("", "", nil)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			errCh := make(chan error)
+			go func() {
+				errCh <- RunBuild(ctx, log, cfg, cmdMock)
+			}()
+
+			assert.Eventually(t, func() bool {
+				_, err := os.Stat(cfg.DtkOcpDoneCompileFlag)
+				return err == nil
+			}, 5*time.Second, 100*time.Millisecond)
+
+			assert.Eventually(t, func() bool {
+				_, err := os.Stat(cfg.DtkOcpStartCompileFlag)
+				return os.IsNotExist(err)
+			}, 5*time.Second, 100*time.Millisecond)
+
+			cancel()
+			err := <-errCh
+			assert.ErrorIs(t, err, context.Canceled)
+		})
+
+	t.Run("should skip installing staged RPMs when createrepo is already present",
+		func(t *testing.T) {
+			sharedDir := t.TempDir()
+			cfg := testConfig(t, sharedDir)
+			stageStubTooling(t, sharedDir)
+
+			cmdMock := cmdMockPkg.NewInterface(t)
+			expectToolingInstall(cmdMock, sharedDir, nil)
+
+			assert.NoError(t, os.WriteFile(cfg.DtkOcpStartCompileFlag, nil, 0o644))
+
+			topDir := "/tmp/DOCA.abc123"
+			cmdMock.EXPECT().RunCommand(mock.Anything, doca.KernelSupportBin,
+				"--verbose", "--dirty",
+				"-s", "/usr/src/kernels/"+testKernelVer,
+				"--tarfile", filepath.Join(sharedDir, constants.DtkSourceArchiveName)).
+				Return("Building under "+topDir+"\n", "", nil)
+
+			cmdMock.EXPECT().RunCommand(mock.Anything, "sh", "-c", mock.Anything).Return("", "", nil)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			errCh := make(chan error)
+			go func() {
+				errCh <- RunBuild(ctx, log, cfg, cmdMock)
+			}()
+
+			assert.Eventually(t, func() bool {
+				_, err := os.Stat(cfg.DtkOcpDoneCompileFlag)
+				return err == nil
+			}, 5*time.Second, 100*time.Millisecond)
+
+			cancel()
+			err := <-errCh
+			assert.ErrorIs(t, err, context.Canceled)
+		})
+
+	t.Run("should fail when the tool does not report its work directory", func(t *testing.T) {
+		sharedDir := t.TempDir()
+		cfg := testConfig(t, sharedDir)
+		stageStubTooling(t, sharedDir)
+
 		cmdMock := cmdMockPkg.NewInterface(t)
-		cmdMock.EXPECT().RunCommand(mock.Anything, "dnf", "install", "-y", "perl").Return("", "", nil)
-		cmdMock.EXPECT().RunCommand(mock.Anything, "dnf", "install", "-y", "ethtool", "autoconf", "pciutils", "automake", "libtool", "python3-devel").Return("", "", errors.New("dnf failed"))
+		expectToolingInstall(cmdMock, sharedDir, nil)
+
+		assert.NoError(t, os.WriteFile(cfg.DtkOcpStartCompileFlag, nil, 0o644))
+
+		cmdMock.EXPECT().RunCommand(mock.Anything, doca.KernelSupportBin,
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return("built everything, said nothing useful", "", nil)
 
 		err := RunBuild(context.Background(), log, cfg, cmdMock)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "failed to install build dependencies")
-	})
-
-	t.Run("should wait for start flag and run build without dkms", func(t *testing.T) {
-		cfgNoDKMS := cfg
-		cfgNoDKMS.UseDKMS = false
-		cfgNoDKMS.AppendDriverBuildFlags = "--kernel 5.14.0-687.13.1.el9_8.x86_64 --distro rhel9.8"
-
-		cmdMock := cmdMockPkg.NewInterface(t)
-		cmdMock.EXPECT().RunCommand(mock.Anything, "dnf", "install", "-y", "perl").Return("", "", nil)
-		cmdMock.EXPECT().RunCommand(mock.Anything, "dnf", "install", "-y", "ethtool", "autoconf", "pciutils", "automake", "libtool", "python3-devel").Return("", "", nil)
-
-		// Create start flag after a short delay
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			f, err := os.Create(startFlag)
-			assert.NoError(t, err)
-			f.Close()
-		}()
-
-		expectedInstallScript := filepath.Join(tempDir, "MLNX_OFED_SRC-1.0.0", "install.pl")
-		// --without-dkms must be present when UseDKMS is false
-		cmdMock.EXPECT().RunCommand(mock.Anything, expectedInstallScript,
-			"--build-only", "--kernel-only", "--without-knem", "--without-iser", "--without-isert",
-			"--without-srp", "--with-mlnx-tools", "--with-ofed-scripts", "--copy-ifnames-udev",
-			"--disable-kmp", "--without-dkms", "--kernel", "5.14.0-687.13.1.el9_8.x86_64",
-			"--distro", "rhel9.8").Return("", "", nil)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		errCh := make(chan error)
-		go func() {
-			errCh <- RunBuild(ctx, log, cfgNoDKMS, cmdMock)
-		}()
-
-		assert.Eventually(t, func() bool {
-			_, err := os.Stat(doneFlag)
-			return err == nil
-		}, 5*time.Second, 100*time.Millisecond)
-
-		assert.Eventually(t, func() bool {
-			_, err := os.Stat(startFlag)
-			return os.IsNotExist(err)
-		}, 5*time.Second, 100*time.Millisecond)
-
-		cancel()
-		err := <-errCh
-		assert.ErrorIs(t, err, context.Canceled)
-	})
-
-	t.Run("should not pass --without-dkms or --disable-kmp when UseDKMS is true", func(t *testing.T) {
-		cfgDKMS := cfg
-		cfgDKMS.UseDKMS = true
-
-		// Use a fresh set of flag files to avoid state from the previous sub-test.
-		startFlagDKMS := filepath.Join(tempDir, "dtk_start_compile_dkms")
-		doneFlagDKMS := filepath.Join(tempDir, "dtk_done_compile_dkms")
-		cfgDKMS.DtkOcpStartCompileFlag = startFlagDKMS
-		cfgDKMS.DtkOcpDoneCompileFlag = doneFlagDKMS
-
-		cmdMock := cmdMockPkg.NewInterface(t)
-		cmdMock.EXPECT().RunCommand(mock.Anything, "dnf", "install", "-y", "perl").Return("", "", nil)
-		cmdMock.EXPECT().RunCommand(mock.Anything, "dnf", "install", "-y", "ethtool", "autoconf", "pciutils", "automake", "libtool", "python3-devel").Return("", "", nil)
-
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			f, err := os.Create(startFlagDKMS)
-			assert.NoError(t, err)
-			f.Close()
-		}()
-
-		expectedInstallScript := filepath.Join(tempDir, "MLNX_OFED_SRC-1.0.0", "install.pl")
-		// When UseDKMS=true, neither --without-dkms nor --disable-kmp should be passed.
-		// This causes install.pl to produce both a DKMS source package (for dkms add
-		// registration in the main container) and pre-compiled kmod binary packages
-		// (which place .ko files without needing kernel headers in the main container).
-		cmdMock.EXPECT().RunCommand(mock.Anything, expectedInstallScript,
-			"--build-only", "--kernel-only", "--without-knem", "--without-iser", "--without-isert",
-			"--without-srp", "--with-mlnx-tools", "--with-ofed-scripts", "--copy-ifnames-udev").
-			Return("", "", nil)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		errCh := make(chan error)
-		go func() {
-			errCh <- RunBuild(ctx, log, cfgDKMS, cmdMock)
-		}()
-
-		assert.Eventually(t, func() bool {
-			_, err := os.Stat(doneFlagDKMS)
-			return err == nil
-		}, 5*time.Second, 100*time.Millisecond)
-
-		assert.Eventually(t, func() bool {
-			_, err := os.Stat(startFlagDKMS)
-			return os.IsNotExist(err)
-		}, 5*time.Second, 100*time.Millisecond)
-
-		cancel()
-		err := <-errCh
-		assert.ErrorIs(t, err, context.Canceled)
+		assert.Contains(t, err.Error(), "could not determine doca-kernel-support work directory")
 	})
 }

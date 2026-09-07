@@ -1,0 +1,27 @@
+# Throwaway build context filter for local image builds.
+# The repo root is ~1GB, almost all of it extracted OFED trees that the
+# image build does not need. Use with: podman build --ignorefile poc/dks/dockerignore
+*
+
+# Consumed by the go_builder and base stages
+!entrypoint
+# go_builder runs `make build`, which only needs the sources: bin/ is lint-only
+# tooling (golangci-lint, go-licenses) and build/ is a stale host-arch binary that
+# gets overwritten anyway. Together they are ~74MB of the 84MB tree.
+entrypoint/bin
+entrypoint/build
+entrypoint/cover.out
+!entrypoint.sh
+!loader.sh
+!stig-fixer.sh
+
+# RHEL_Dockerfile adds this to both driver-src and precompiled; without it the
+# RHEL build fails at ADD while the Ubuntu build does not care.
+!dtk_nic_driver_build.sh
+
+# Only needed when D_OFED_URL_PATH points at a local tarball instead of a URL.
+# The deb and rpm builds take different archives: -debian for Ubuntu, plain for RHEL.
+!ofed
+ofed/*
+!ofed/MLNX_OFED_SRC-debian-26.07-0.7.7.0.tgz
+!ofed/MLNX_OFED_SRC-26.07-0.7.7.0.tgz
